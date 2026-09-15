@@ -10,7 +10,7 @@ import {
   PaginatedMessagesResponseSchema,
   PromptResponseSchema,
 } from '@/gen/airlock/v1/api_pb'
-import { enrichMessages as enrichMessagesShared, formatToolArgs, toolDescription, toolLabel, type MsgBlock, type ToolBlock } from '@/utils/messageGroup'
+import { enrichMessages as enrichMessagesShared, formatToolArgs, stripPrivateReasoning, toolDescription, toolLabel, type MsgBlock, type ToolBlock } from '@/utils/messageGroup'
 import { useConversationFeedStore } from '@/stores/conversationFeed'
 import { useAirlockI18n } from '@/i18n'
 
@@ -240,14 +240,24 @@ export const useChatStore = defineStore('chat', () => {
         // renders, so the live order matches the persisted blocks[].
         const tail = streamingBlocks.value[streamingBlocks.value.length - 1]
         if (textBlockBoundary || !tail || tail.kind !== 'text') {
-          streamingBlocks.value.push({ kind: 'text', text: ev.text })
+          const block: { kind: 'text'; text: string; rawText?: string } = {
+            kind: 'text',
+            text: stripPrivateReasoning(ev.text),
+            rawText: ev.text,
+          }
+          streamingBlocks.value.push(block)
         } else {
-          tail.text += ev.text
+          const rawText = ((tail as any).rawText ?? tail.text) + ev.text
+          ;(tail as any).rawText = rawText
+          tail.text = stripPrivateReasoning(rawText)
         }
         // streamingText is kept only for empty-state / watcher truthiness
         // now; the bubble renders from streamingBlocks.
         textBlockBoundary = false
-        streamingText.value += ev.text
+        streamingText.value = streamingBlocks.value
+          .filter((block): block is { kind: 'text'; text: string } => block.kind === 'text')
+          .map((block) => block.text)
+          .join('')
       }),
       onRunMessage('run.tool_call', (payload) => {
         const ev = tryFromJson<ToolCallEvent>(ToolCallEventSchema, payload)

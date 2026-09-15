@@ -3,6 +3,21 @@ import type { AgentMessageInfo } from '@/gen/airlock/v1/types_pb'
 import { enrichMessages } from './messageGroup'
 
 describe('enrichMessages', () => {
+  it('removes a provider <think> block from a plain final assistant reply', () => {
+    const messages = [
+      {
+        id: 'assistant-final',
+        role: 'assistant',
+        source: 'user',
+        content: '<think>Let me formulate the result for the user.</think>\n\nГотово: задача сохранена.',
+      },
+    ] as unknown as AgentMessageInfo[]
+
+    enrichMessages(messages)
+
+    expect(messages[0].content).toBe('Готово: задача сохранена.')
+  })
+
   it('hides planning text from a tool-calling step but preserves the final answer', () => {
     const messages = [
       {

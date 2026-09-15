@@ -93,6 +93,14 @@ export type MsgBlock = TextBlock | ToolBlock
 
 const metaKeys = new Set(['request_confirmation', 'description'])
 
+// Some OpenAI-compatible providers encode private chain-of-thought in
+// <think>…</think> inside a normal text delta instead of a dedicated reasoning
+// part. A missing closing tag is intentional here: while a response streams,
+// nothing inside an open private block may flash in the user-visible bubble.
+export function stripPrivateReasoning(text: string): string {
+  return text.replace(/<think(?:ing)?(?:\s[^>]*)?>[\s\S]*?(?:<\/think(?:ing)?>|$)/gi, '').trim()
+}
+
 // toolDescription pulls the plain-language `description` a tool call carries
 // (run_js) so the transcript can show it in place of the raw code. `args`
 // may be the raw object or a JSON string (live path). '' when absent.
@@ -167,7 +175,7 @@ export function enrichMessages(msgs: AgentMessageInfo[], t: Translate = defaultT
     // provider that serializes its reasoning as text from leaking it into the
     // persisted transcript.
     const hasToolCall = !!parts?.some((p) => p.type === 'tool-call' && p.toolCallId)
-    const displayContent = hasToolCall ? '' : msg.content
+    const displayContent = hasToolCall ? '' : stripPrivateReasoning(msg.content)
     const rowBlocks: MsgBlock[] = []
     if (parts) {
       for (const p of parts) {
@@ -186,11 +194,13 @@ export function enrichMessages(msgs: AgentMessageInfo[], t: Translate = defaultT
           callEntries.set(p.toolCallId, tb)
           rowBlocks.push(tb)
         } else if (!hasToolCall && p.type === 'text' && typeof p.text === 'string' && p.text) {
+          const text = stripPrivateReasoning(p.text)
+          if (!text) continue
           const last = rowBlocks[rowBlocks.length - 1]
           // Coalesce consecutive text parts within a row (continuous
           // stream); a fold boundary across steps stays a separate block.
-          if (last && last.kind === 'text') last.text += p.text
-          else rowBlocks.push({ kind: 'text', text: p.text })
+          if (last && last.kind === 'text') last.text += text
+          else rowBlocks.push({ kind: 'text', text })
         }
       }
     }
@@ -223,7 +233,7 @@ export function enrichMessages(msgs: AgentMessageInfo[], t: Translate = defaultT
     if (rowBlocks.some((b) => b.kind === 'tool') || runId) {
       ;(msg as any).blocks = rowBlocks
     }
-    if (hasToolCall) msg.content = ''
+    msg.content = hasToolCall ? '' : displayContent
   }
 
   // Pass 2: patch each tool-result row's output into its tool block (same
