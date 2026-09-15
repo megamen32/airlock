@@ -77,7 +77,7 @@ export function toolOutputInfo(out: any, t: Translate): { text: string; outcome:
 // toolLabel maps a raw tool name (+ its call args) to the human label
 // shown in the transcript. User-registered tools keep their own name.
 export function toolLabel(toolName: string, t: Translate): string {
-  if (toolName === 'run_js') return t('chat.tool.code')
+  if (toolName === 'run_js') return t('chat.tool.action')
   return toolName
 }
 

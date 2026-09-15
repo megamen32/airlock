@@ -301,9 +301,9 @@ export const chatMessages = defineMessages({
     defaultMessage: 'Approve or reject the pending tool call above first.',
     description: 'Disabled composer placeholder while a system-assistant tool call awaits confirmation.',
   },
-  'chat.tool.code': {
-    defaultMessage: 'Code',
-    description: 'Human-facing label for the framework run_js tool.',
+  'chat.tool.action': {
+    defaultMessage: 'Action',
+    description: 'Human-facing label for a framework action executed on the user\'s behalf.',
   },
   'chat.tool.executionDenied': {
     defaultMessage: 'Tool call execution denied.',

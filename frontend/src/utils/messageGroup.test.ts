@@ -54,7 +54,7 @@ describe('enrichMessages', () => {
     const anchor = messages[0] as any
     expect(anchor.content).toBe('Задача создана на завтра.')
     expect(anchor.blocks).toHaveLength(2)
-    expect(anchor.blocks[0]).toMatchObject({ kind: 'tool', description: 'Create a task' })
+    expect(anchor.blocks[0]).toMatchObject({ kind: 'tool', label: 'Action', description: 'Create a task' })
     expect(anchor.blocks[1]).toEqual({ kind: 'text', text: 'Задача создана на завтра.' })
     expect(JSON.stringify(anchor.blocks)).not.toContain('return await tools.create_task')
     expect((messages[1] as any)._hidden).toBe(true)
