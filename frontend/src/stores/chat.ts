@@ -104,6 +104,27 @@ export const useChatStore = defineStore('chat', () => {
   // enrichMessages joins persisted per-step rows on refetch.
   let textBlockBoundary = false
 
+  // A model may stream its private planning as text before announcing a tool
+  // call. Once the call arrives we know that text was not the final answer,
+  // so remove only the text from that LLM step while retaining earlier tool
+  // cards and all subsequent tool-free answer text.
+  function discardToolPlanningText() {
+    let lastToolIndex = -1
+    for (let i = streamingBlocks.value.length - 1; i >= 0; i--) {
+      if (streamingBlocks.value[i].kind === 'tool') {
+        lastToolIndex = i
+        break
+      }
+    }
+    streamingBlocks.value = streamingBlocks.value.filter(
+      (block, index) => block.kind !== 'text' || index <= lastToolIndex,
+    )
+    streamingText.value = streamingBlocks.value
+      .filter((block): block is { kind: 'text'; text: string } => block.kind === 'text')
+      .map((block) => block.text)
+      .join('')
+  }
+
   // Extracts the integer N from "Context compacted. N tokens freed." Falls
   // back to 0 when the agent emits a different shape — the divider still
   // renders, just without a token count.
@@ -231,6 +252,7 @@ export const useChatStore = defineStore('chat', () => {
       onRunMessage('run.tool_call', (payload) => {
         const ev = tryFromJson<ToolCallEvent>(ToolCallEventSchema, payload)
         if (!ev || !isActiveRun(ev.runId)) return
+        discardToolPlanningText()
         textBlockBoundary = true
         activeToolCalls.set(ev.toolCallId, {
           toolCallId: ev.toolCallId,

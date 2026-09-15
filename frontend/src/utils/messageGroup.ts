@@ -161,6 +161,13 @@ export function enrichMessages(msgs: AgentMessageInfo[], t: Translate = defaultT
     // blocks renderer — i.e. it silently disappears from the chat.
     if (msg.source && msg.source !== 'user') continue
     const parts = parseParts((msg as any).parts)
+    // Text emitted in the same model step as a tool call is planning/code,
+    // not a user-facing answer. Keep the structured tool card, then show the
+    // next tool-free model step as the concise result. This also prevents a
+    // provider that serializes its reasoning as text from leaking it into the
+    // persisted transcript.
+    const hasToolCall = !!parts?.some((p) => p.type === 'tool-call' && p.toolCallId)
+    const displayContent = hasToolCall ? '' : msg.content
     const rowBlocks: MsgBlock[] = []
     if (parts) {
       for (const p of parts) {
@@ -178,7 +185,7 @@ export function enrichMessages(msgs: AgentMessageInfo[], t: Translate = defaultT
           }
           callEntries.set(p.toolCallId, tb)
           rowBlocks.push(tb)
-        } else if (p.type === 'text' && typeof p.text === 'string' && p.text) {
+        } else if (!hasToolCall && p.type === 'text' && typeof p.text === 'string' && p.text) {
           const last = rowBlocks[rowBlocks.length - 1]
           // Coalesce consecutive text parts within a row (continuous
           // stream); a fold boundary across steps stays a separate block.
@@ -191,8 +198,8 @@ export function enrichMessages(msgs: AgentMessageInfo[], t: Translate = defaultT
     // single text block — only needed when this row folds into / anchors
     // a runId group; a lone plain-text row keeps the content fast-path.
     const runId = (msg as any).runId as string | undefined
-    if (rowBlocks.length === 0 && msg.content && runId) {
-      rowBlocks.push({ kind: 'text', text: msg.content })
+    if (rowBlocks.length === 0 && displayContent && runId) {
+      rowBlocks.push({ kind: 'text', text: displayContent })
     }
 
     if (runId) {
@@ -200,8 +207,8 @@ export function enrichMessages(msgs: AgentMessageInfo[], t: Translate = defaultT
       if (anchor) {
         const anchorBlocks = ((anchor as any).blocks ??= [] as MsgBlock[])
         anchorBlocks.push(...rowBlocks)
-        if (msg.content) {
-          anchor.content = anchor.content ? `${anchor.content}\n${msg.content}` : msg.content
+        if (displayContent) {
+          anchor.content = anchor.content ? `${anchor.content}\n${displayContent}` : displayContent
         }
         ;(msg as any)._hidden = true
         continue
@@ -216,6 +223,7 @@ export function enrichMessages(msgs: AgentMessageInfo[], t: Translate = defaultT
     if (rowBlocks.some((b) => b.kind === 'tool') || runId) {
       ;(msg as any).blocks = rowBlocks
     }
+    if (hasToolCall) msg.content = ''
   }
 
   // Pass 2: patch each tool-result row's output into its tool block (same
