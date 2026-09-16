@@ -9,6 +9,7 @@ import (
 	"github.com/airlockrun/airlock/attachref"
 	"github.com/airlockrun/airlock/db/dbq"
 	"github.com/airlockrun/airlock/service/execution"
+	"github.com/airlockrun/goai/middleware"
 	"github.com/airlockrun/goai/stream"
 	solprovider "github.com/airlockrun/sol/provider"
 	"github.com/google/uuid"
@@ -46,6 +47,15 @@ type runtimeModel struct {
 func (m *runtimeModel) ID() string       { return m.resolved.ModelID }
 func (m *runtimeModel) Provider() string { return m.resolved.ProviderID }
 
+// extractInlineReasoning separates tagged provider reasoning before the chat
+// runtime persists visible assistant text.
+func extractInlineReasoning(model stream.Model, enabled bool) stream.Model {
+	if enabled {
+		return middleware.WrapModel(model, &middleware.ExtractReasoningMiddleware{TagName: "think"})
+	}
+	return model
+}
+
 func (m *runtimeModel) Stream(ctx context.Context, options *stream.CallOptions) (<-chan stream.Event, error) {
 	if m.ownerToken.Valid {
 		ctx = execution.WithRuntimeOwner(ctx, m.runID, uuid.UUID(m.ownerToken.Bytes))
@@ -78,7 +88,7 @@ func (m *runtimeModel) Stream(ctx context.Context, options *stream.CallOptions) 
 	if err := attachref.ResolveForLLM(ctx, m.service.s3, dbq.New(m.service.db.Pool()), m.agentID, policy, opts.Messages); err != nil {
 		return nil, err
 	}
-	provider := solprovider.CreateModel(m.resolved.ProviderID, m.resolved.ModelID, m.service.LanguageModelOptions(m.resolved))
+	provider := extractInlineReasoning(solprovider.CreateModel(m.resolved.ProviderID, m.resolved.ModelID, m.service.LanguageModelOptions(m.resolved)), m.resolved.Reasoning)
 	capture := LlmUsageCapture{ProviderCatalogID: m.resolved.ProviderID, ProviderSlug: m.resolved.ProviderSlug, Model: m.resolved.ModelID, Capability: m.capability, Slug: m.slug, TaskTokensAccounted: true}
 	requestID := uuid.New()
 	started := time.Now()

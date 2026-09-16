@@ -54,6 +54,7 @@ type ResolvedModel struct {
 	BaseURL                   string
 	IncludeUsage              *bool
 	SupportsStructuredOutputs *bool
+	Reasoning                 bool
 }
 
 func (h *Service) ResolveModel(ctx context.Context, agentID, slug, capability string) (ResolvedModel, error) {
@@ -114,6 +115,7 @@ func (h *Service) ResolveModel(ctx context.Context, agentID, slug, capability st
 	var includeUsage *bool
 	var supportsStructuredOutputs *bool
 	var limits session.ModelLimits
+	var reasoning bool
 	if p.CatalogID == "openai-compatible" {
 		confirmed, modelErr := q.GetProviderModel(ctx, dbq.GetProviderModelParams{
 			ConfiguredProviderID: p.ID,
@@ -124,6 +126,7 @@ func (h *Service) ResolveModel(ctx context.Context, agentID, slug, capability st
 		}
 		includeUsage = &confirmed.IncludeUsage
 		supportsStructuredOutputs = &confirmed.StructuredOutputs
+		reasoning = confirmed.Reasoning
 		limits = session.ModelLimits{Context: int(confirmed.ContextLimit), Output: int(confirmed.OutputLimit)}
 	} else if info, ok := solprovider.GetModelInfo(p.CatalogID, modelName); ok && info.Limit != nil {
 		limits = session.ModelLimits{Context: info.Limit.Context, Input: info.Limit.Input, Output: info.Limit.Output}
@@ -140,6 +143,7 @@ func (h *Service) ResolveModel(ctx context.Context, agentID, slug, capability st
 		ProviderID: p.CatalogID, ProviderSlug: p.Slug, ModelID: modelName,
 		ApiKey: decrypted, BaseURL: p.BaseUrl, IncludeUsage: includeUsage,
 		SupportsStructuredOutputs: supportsStructuredOutputs,
+		Reasoning:                 reasoning,
 	}, nil
 }
 
