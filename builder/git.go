@@ -487,18 +487,22 @@ func MigrationVersionAt(repoPath, commit string) (int, error) {
 // on-disk path). --no-hardlinks so the two repos never share object storage.
 // Used by agent clone; the destination must not already exist.
 func CopyAgentRepo(basePath, srcID, dstID string) error {
-	src := AgentRepoPath(basePath, srcID)
-	dst := AgentRepoPath(basePath, dstID)
+	absoluteBasePath, err := filepath.Abs(basePath)
+	if err != nil {
+		return fmt.Errorf("resolve agent repos path: %w", err)
+	}
+	src := AgentRepoPath(absoluteBasePath, srcID)
+	dst := AgentRepoPath(absoluteBasePath, dstID)
 	if _, err := os.Stat(filepath.Join(src, ".git")); err != nil {
 		return fmt.Errorf("source agent repo %s not initialized: %w", srcID, err)
 	}
 	if _, err := os.Stat(dst); err == nil {
 		return fmt.Errorf("destination agent repo %s already exists", dstID)
 	}
-	if err := os.MkdirAll(basePath, 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", basePath, err)
+	if err := os.MkdirAll(absoluteBasePath, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", absoluteBasePath, err)
 	}
-	if err := git(basePath, "clone", "--no-hardlinks", src, dst); err != nil {
+	if err := git(absoluteBasePath, "clone", "--no-hardlinks", src, dst); err != nil {
 		return fmt.Errorf("git clone %s: %w", srcID, err)
 	}
 	// Detach from the source path so the clone is standalone.
