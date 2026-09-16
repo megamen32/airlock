@@ -745,7 +745,9 @@ func prepareConnectorModuleFiles(sourceDir, outputDir string) (string, func(), e
 func connectorBuildEnvironment(platform string) ([]string, error) {
 	environment := []string{
 		"CGO_ENABLED=0", "GOMODCACHE=/tmp/go-mod", "GOCACHE=/tmp/go-cache",
-		"GOTMPDIR=/tmp/work", "GOFLAGS=-buildvcs=false -mod=readonly", "GOSUMDB=off",
+		// Match compiler parallelism to the sandbox's 2 GiB / 512 PID
+		// limits rather than the host's (potentially very large) CPU count.
+		"GOTMPDIR=/tmp/work", "GOMAXPROCS=2", "GOFLAGS=-buildvcs=false -mod=readonly -p=2", "GOSUMDB=off",
 	}
 	if platform == "" {
 		return environment, nil
