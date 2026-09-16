@@ -90,6 +90,30 @@ func (h *Service) SessionLoad(ctx context.Context, convID uuid.UUID) (wire.Sessi
 	}, nil
 }
 
+// SessionLoadCurrent loads only the transcript bound to an active, proved
+// invocation. It intentionally takes a run ID rather than a conversation ID:
+// remote applications must not be able to enumerate other users' sessions by
+// guessing UUIDs.
+func (h *Service) SessionLoadCurrent(ctx context.Context, runID uuid.UUID) (wire.SessionLoadResponse, error) {
+	admitted, err := h.ResolveRun(ctx, runID)
+	if err != nil {
+		return wire.SessionLoadResponse{}, err
+	}
+	convID, err := parseCurrentConversationID(admitted.Runtime.ConversationID)
+	if err != nil {
+		return wire.SessionLoadResponse{}, err
+	}
+	return h.SessionLoad(ctx, convID)
+}
+
+func parseCurrentConversationID(value string) (uuid.UUID, error) {
+	convID, err := parseUUID(value)
+	if err != nil {
+		return uuid.Nil, apperr.Detail(apperr.ErrInvalidInput, "current invocation is not attached to a conversation")
+	}
+	return convID, nil
+}
+
 func (h *Service) SessionAppend(ctx context.Context, convID uuid.UUID, req wire.SessionAppendRequest, runID pgtype.UUID) (wire.SessionAppendResponse, error) {
 	agentID, admissionErr := h.admit(ctx, dbq.New(h.db.Pool()))
 	if admissionErr != nil {
