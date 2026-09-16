@@ -678,6 +678,7 @@ function formatTokens(n: number): string {
                       </div>
                     </div>
                   </template>
+                  <MessageParts v-else-if="b.kind === 'media'" :parts="b.parts" />
                 </template>
               </div>
               <div

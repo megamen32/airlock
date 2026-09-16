@@ -13,6 +13,7 @@ import api from '@/api/client'
 import { useMarkdown } from '@/composables/useMarkdown'
 import { enrichMessages } from '@/utils/messageGroup'
 import ToolBadge from '@/components/chat/ToolBadge.vue'
+import MessageParts from '@/components/chat/MessageParts.vue'
 import { useAirlockI18n } from '@/i18n'
 
 const route = useRoute()
@@ -242,6 +243,7 @@ onMounted(async () => {
                     :error="b.error"
                     :outcome="b.outcome"
                   />
+                  <MessageParts v-else-if="b.kind === 'media'" :parts="b.parts" />
                 </template>
               </div>
               <div

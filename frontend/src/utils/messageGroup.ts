@@ -19,6 +19,7 @@
 
 import type { AgentMessageInfo } from '@/gen/airlock/v1/types_pb'
 import type { AirlockI18nComposable } from '@/i18n'
+import type { DisplayPart } from '@/components/chat/MessageParts.vue'
 import { chatMessages } from '@/i18n/messages/chat'
 
 type Translate = AirlockI18nComposable['t']
@@ -86,10 +87,15 @@ export interface TextBlock {
   text: string
 }
 
+export interface MediaBlock {
+  kind: 'media'
+  parts: DisplayPart[]
+}
+
 // MsgBlock is the single ordered render unit shared by the persisted
 // path (enrichMessages) and the live streaming path (chat.ts), so both
 // render an assistant turn identically and in true sequence order.
-export type MsgBlock = TextBlock | ToolBlock
+export type MsgBlock = TextBlock | ToolBlock | MediaBlock
 
 const metaKeys = new Set(['request_confirmation', 'description'])
 
@@ -184,6 +190,12 @@ export function enrichMessages(msgs: AgentMessageInfo[], t: Translate = defaultT
           // stream); a fold boundary across steps stays a separate block.
           if (last && last.kind === 'text') last.text += p.text
           else rowBlocks.push({ kind: 'text', text: p.text })
+        } else if (['file', 'image', 'audio', 'video'].includes(p.type)) {
+          // air.output persists a separate assistant row in the same run.
+          // Keep its rich parts when folding, rather than its text fallback.
+          const last = rowBlocks[rowBlocks.length - 1]
+          if (last?.kind === 'media') last.parts.push(p)
+          else rowBlocks.push({ kind: 'media', parts: [p] })
         }
       }
     }
@@ -213,7 +225,7 @@ export function enrichMessages(msgs: AgentMessageInfo[], t: Translate = defaultT
     // or a runId anchor (so later steps have somewhere to append). A lone
     // plain-text assistant row gets no blocks and uses the content path
     // unchanged.
-    if (rowBlocks.some((b) => b.kind === 'tool') || runId) {
+    if (rowBlocks.some((b) => b.kind !== 'text') || runId) {
       ;(msg as any).blocks = rowBlocks
     }
   }
