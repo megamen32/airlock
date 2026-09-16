@@ -126,6 +126,18 @@ func validateConnectorManifest(manifest connectorManifest, slug string) error {
 }
 
 func (b *BuildService) buildConnectorArtifacts(ctx context.Context, agentID, sourceRef string, buildID pgtype.UUID, repoPath, goProxyDir string, logLine func(string)) error {
+	// Repository configuration may be relative to the server's working
+	// directory, but Docker sandbox mount sources must be absolute.
+	repoPath, err := filepath.Abs(repoPath)
+	if err != nil {
+		return fmt.Errorf("resolve connector source: %w", err)
+	}
+	if goProxyDir != "" {
+		goProxyDir, err = filepath.Abs(goProxyDir)
+		if err != nil {
+			return fmt.Errorf("resolve connector module proxy: %w", err)
+		}
+	}
 	packages, err := discoverConnectorPackages(repoPath)
 	if err != nil {
 		return err
@@ -138,6 +150,10 @@ func (b *BuildService) buildConnectorArtifacts(ctx context.Context, agentID, sou
 		return fmt.Errorf("create connector artifact workspace: %w", err)
 	}
 	defer os.RemoveAll(outputDir)
+	outputDir, err = filepath.Abs(outputDir)
+	if err != nil {
+		return fmt.Errorf("resolve connector output: %w", err)
+	}
 	built := make([]builtConnector, 0, len(packages))
 	for _, pkg := range packages {
 		logLine(fmt.Sprintf("Building connector %s manifest binary...", pkg.slug))

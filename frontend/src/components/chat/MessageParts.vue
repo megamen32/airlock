@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
+import api from '@/api/client'
 import { renderMarkdown } from '@/composables/useMarkdown'
 import { useAirlockI18n } from '@/i18n'
 import ImageAlbum from './ImageAlbum.vue'
@@ -24,6 +25,28 @@ type Block =
 
 const props = defineProps<{ parts: DisplayPart[] }>()
 const { t } = useAirlockI18n()
+const downloadFailed = ref(false)
+
+async function downloadFile(event: MouseEvent, part: DisplayPart) {
+  // The browser has an in-memory bearer, not a navigable auth cookie.
+  // Fetch through the normal API client before saving a local blob URL.
+  if (!part.url?.startsWith('/api/v1/conversations/')) return
+  event.preventDefault()
+  downloadFailed.value = false
+  try {
+    const response = await api.get<Blob>(part.url, { responseType: 'blob' })
+    const url = URL.createObjectURL(response.data)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = part.filename || 'file'
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  } catch {
+    downloadFailed.value = true
+  }
+}
 
 // kindOf decides how to render a part from its mimeType first (so a unified
 // file part with an image/* type renders as an image), falling back to the
@@ -81,6 +104,7 @@ function fileSizeLabel(p: DisplayPart): string {
         :download="block.part.filename || ''"
         target="_blank"
         rel="noopener noreferrer"
+        @click="downloadFile($event, block.part)"
       >
         <i class="pi pi-file" style="font-size: 1.25rem" />
         <div style="display: flex; flex-direction: column; min-width: 0">
@@ -99,6 +123,7 @@ function fileSizeLabel(p: DisplayPart): string {
         <div v-if="block.part.text" style="font-size: 0.85rem; margin-top: 0.25rem">{{ block.part.text }}</div>
       </div>
     </template>
+    <p v-if="downloadFailed" role="alert">{{ t('chat.file.downloadFailed') }}</p>
   </div>
 </template>
 

@@ -1,6 +1,10 @@
 import { defineMessages } from './define'
 
 export const chatMessages = defineMessages({
+  'chat.file.downloadFailed': {
+    defaultMessage: 'Download failed. Please try again.',
+    description: 'Shown when an authenticated chat attachment download fails.',
+  },
   'chat.systemAgent.status.running': {
     defaultMessage: 'Running',
     description: 'Status label for a system-agent run that is executing.',
