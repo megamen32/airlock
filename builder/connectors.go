@@ -81,6 +81,15 @@ func discoverConnectorPackages(projectDir string) ([]connectorPackage, error) {
 		if protocol.ValidateKind(entry.Name()) != nil {
 			return nil, fmt.Errorf("connector slug %q must contain lowercase letters, digits, and internal hyphens", entry.Name())
 		}
+		// Applying a Git source archive can leave the empty directory of a
+		// removed connector behind. It is not a buildable connector package.
+		children, err := os.ReadDir(filepath.Join(root, entry.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("inspect connector %s: %w", entry.Name(), err)
+		}
+		if len(children) == 0 {
+			continue
+		}
 		packages = append(packages, connectorPackage{slug: entry.Name(), packagePath: "./connectors/" + entry.Name()})
 	}
 	sort.Slice(packages, func(i, j int) bool { return packages[i].slug < packages[j].slug })

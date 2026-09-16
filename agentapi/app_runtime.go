@@ -92,12 +92,15 @@ func (h *Handler) RunComplete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) Print(w http.ResponseWriter, r *http.Request) {
-	var req wire.PrintRequest
+	var req struct {
+		wire.PrintRequest
+		IdempotencyKey string `json:"idempotencyKey,omitempty"`
+	}
 	if err := readAppJSON(r, &req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	err := h.appService().Print(callbackContext(r), req)
+	err := h.appService().PrintWithKey(callbackContext(r), req.PrintRequest, req.IdempotencyKey)
 	if err != nil {
 		h.appError(w, err)
 		return

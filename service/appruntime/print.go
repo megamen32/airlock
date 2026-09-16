@@ -19,6 +19,11 @@ import (
 )
 
 func (h *Service) Print(ctx context.Context, req wire.PrintRequest) error {
+	return h.PrintWithKey(ctx, req, "")
+}
+
+// PrintWithKey extends the app JSON API without changing the server's SDK wire dependency.
+func (h *Service) PrintWithKey(ctx context.Context, req wire.PrintRequest, idempotencyKey string) error {
 	agentID, admissionErr := h.admit(ctx, dbq.New(h.db.Pool()))
 	if admissionErr != nil {
 		return admissionErr
@@ -26,6 +31,16 @@ func (h *Service) Print(ctx context.Context, req wire.PrintRequest) error {
 
 	if len(req.Parts) == 0 {
 		return apperr.Detail(apperr.ErrInvalidInput, "parts are required")
+	}
+	if idempotencyKey != "" {
+		if len(idempotencyKey) > 128 || strings.TrimSpace(idempotencyKey) == "" || req.Topic != "" || req.RunID == "" || req.ConversationID == "" {
+			return apperr.Detail(apperr.ErrInvalidInput, "idempotent output requires a bound conversation and key")
+		}
+		for _, part := range req.Parts {
+			if part.Type != "text" || part.Source != "" || len(part.Data) > 0 {
+				return apperr.Detail(apperr.ErrInvalidInput, "idempotent output supports text only")
+			}
+		}
 	}
 
 	q := dbq.New(h.db.Pool())
@@ -204,6 +219,7 @@ func (h *Service) Print(ctx context.Context, req wire.PrintRequest) error {
 	} else if req.ConversationID != "" {
 		// Direct output() — single conversation, ephemeral.
 		if err := runtimesvc.PostToConversation(ctx, deps, runtimesvc.PostOpts{
+			IdempotencyKey: idempotencyKey,
 			AgentID:        agentID,
 			ConversationID: directConvID,
 			RunID:          runUUID,

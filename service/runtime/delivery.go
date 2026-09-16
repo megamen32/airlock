@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/url"
 	"path"
 	"strings"
@@ -34,6 +35,7 @@ type PostDeps struct {
 
 // PostOpts configures a message post to a conversation.
 type PostOpts struct {
+	IdempotencyKey string // optional native text-only persistence key; scoped to agent+conversation
 	AgentID        uuid.UUID
 	ConversationID uuid.UUID
 	RunID          uuid.UUID          // zero = no run linkage
@@ -70,6 +72,9 @@ func PostToConversation(ctx context.Context, deps PostDeps, opts PostOpts) error
 			return err
 		}
 	}
+	if opts.IdempotencyKey != "" && (conv.Source == "bridge" || opts.TriggerLLM) {
+		return errors.New("idempotent output supports native conversations without LLM triggering only")
+	}
 
 	// Build text summary if not provided.
 	text := opts.Text
@@ -95,7 +100,15 @@ func PostToConversation(ctx context.Context, deps PostDeps, opts PostOpts) error
 	if opts.RunID != uuid.Nil {
 		runID = toPgUUID(opts.RunID)
 	}
-	if _, err := q.CreateMessage(ctx, dbq.CreateMessageParams{
+	if opts.IdempotencyKey != "" {
+		inserted, err := storeIdempotentOutput(ctx, deps, opts, text, partsJSON, runID)
+		if err != nil {
+			return err
+		}
+		if !inserted {
+			return nil
+		}
+	} else if _, err := q.CreateMessage(ctx, dbq.CreateMessageParams{
 		ConversationID: toPgUUID(opts.ConversationID),
 		Role:           opts.Role,
 		Content:        text,
@@ -191,6 +204,36 @@ func PostToConversation(ctx context.Context, deps PostDeps, opts PostOpts) error
 	}
 
 	return nil
+}
+
+// storeIdempotentOutput uses the message primary key as the atomic dedupe key.
+// Run IDs deliberately do not participate: retries execute under new job runs.
+func storeIdempotentOutput(ctx context.Context, deps PostDeps, opts PostOpts, text string, partsJSON []byte, runID pgtype.UUID) (bool, error) {
+	if strings.TrimSpace(opts.IdempotencyKey) == "" || len(opts.IdempotencyKey) > 128 {
+		return false, errors.New("invalid output idempotency key")
+	}
+	for _, part := range opts.Parts {
+		if part.Type != "text" || part.Source != "" || len(part.Data) > 0 {
+			return false, errors.New("idempotent output supports text only")
+		}
+	}
+	id := uuid.NewSHA1(opts.AgentID, []byte("native-output:"+opts.ConversationID.String()+":"+opts.IdempotencyKey))
+	result, err := deps.DB.Pool().Exec(ctx, `INSERT INTO agent_messages(id,conversation_id,role,content,parts,run_id,source,ephemeral,file_keys,cost_estimate) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'{}'::text[],0) ON CONFLICT(id) DO NOTHING`, toPgUUID(id), toPgUUID(opts.ConversationID), opts.Role, text, partsJSON, runID, opts.Source, opts.Ephemeral)
+	if err != nil {
+		return false, err
+	}
+	if result.RowsAffected() == 1 {
+		return true, nil
+	}
+	var same bool
+	err = deps.DB.Pool().QueryRow(ctx, `SELECT conversation_id=$2 AND role=$3 AND content=$4 AND parts IS NOT DISTINCT FROM $5::jsonb AND source=$6 AND ephemeral=$7 FROM agent_messages WHERE id=$1`, toPgUUID(id), toPgUUID(opts.ConversationID), opts.Role, text, partsJSON, opts.Source, opts.Ephemeral).Scan(&same)
+	if err != nil {
+		return false, err
+	}
+	if !same {
+		return false, errors.New("output idempotency key reused with different content")
+	}
+	return false, nil
 }
 
 // mediaPartNeedsPresign returns true when a part's source should be turned

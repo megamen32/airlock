@@ -848,6 +848,8 @@ func NewRouter(cfg RouterConfig) *Router {
 	r.Route("/api/agent", func(r chi.Router) {
 		r.Use(auth.AgentMiddleware(cfg.JWTSecret, dbq.New(cfg.DB.Pool())))
 		r.Get("/members", ah.ListMembers)
+		r.Post("/members", ah.AddMember)
+		r.Delete("/members", ah.RemoveMember)
 		r.Post("/agents/{definition}/runs", ah.StartAgent)
 		r.Get("/agents/{definition}/runs", ah.ListAgentRuns)
 		r.Get("/agents/{definition}/runs/{id}", ah.GetAgentRun)
@@ -871,6 +873,7 @@ func NewRouter(cfg RouterConfig) *Router {
 		r.Delete("/storage/*", ah.StorageDelete)
 		r.Get("/storage", ah.StorageList)
 		r.Get("/session/current/messages", ah.SessionLoadCurrent)
+		r.Post("/session/person/messages", ah.SessionLoadPerson)
 		r.Post("/model-preference", ah.SetCurrentUserTextModel)
 		r.Get("/session/{convID}/messages", ah.SessionLoad)
 		r.Post("/session/{convID}/messages", ah.SessionAppend)
