@@ -4,11 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
+	"github.com/airlockrun/airlock/authz"
 	"github.com/airlockrun/airlock/db/dbq"
 	"github.com/airlockrun/airlock/modelresolve"
+	basesvc "github.com/airlockrun/airlock/service"
+	modelssvc "github.com/airlockrun/airlock/service/models"
 	solprovider "github.com/airlockrun/sol/provider"
 	"github.com/airlockrun/sol/session"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -58,6 +63,16 @@ type ResolvedModel struct {
 }
 
 func (h *Service) ResolveModel(ctx context.Context, agentID, slug, capability string) (ResolvedModel, error) {
+	return h.resolveModel(ctx, agentID, slug, capability, uuid.Nil, authz.Principal{})
+}
+
+// ResolveModelForUser applies one caller's text-model preference to an
+// invocation-bound run. Named agent model slots always take precedence.
+func (h *Service) ResolveModelForUser(ctx context.Context, agentID, slug, capability string, userID uuid.UUID, principal authz.Principal) (ResolvedModel, error) {
+	return h.resolveModel(ctx, agentID, slug, capability, userID, principal)
+}
+
+func (h *Service) resolveModel(ctx context.Context, agentID, slug, capability string, preferenceUserID uuid.UUID, principal authz.Principal) (ResolvedModel, error) {
 	q := dbq.New(h.db.Pool())
 
 	agentUUID, parseErr := parseUUID(agentID)
@@ -70,6 +85,30 @@ func (h *Service) ResolveModel(ctx context.Context, agentID, slug, capability st
 		providerRowID pgtype.UUID
 		modelName     string
 	)
+	if slug == "" && normalizeCapability(capability) == "text" && preferenceUserID != uuid.Nil {
+		preference, preferenceErr := q.GetAgentUserModelPreference(ctx, dbq.GetAgentUserModelPreferenceParams{
+			AgentID: pgAgentID,
+			UserID:  toPgUUID(preferenceUserID),
+		})
+		switch {
+		case errors.Is(preferenceErr, pgx.ErrNoRows):
+		case preferenceErr != nil:
+			return ResolvedModel{}, fmt.Errorf("get caller model preference: %w", preferenceErr)
+		default:
+			entitlementErr := modelssvc.CheckEntitled(ctx, q, principal, preference.CatalogID, preference.Model)
+			if entitlementErr == nil {
+				providerRowID, modelName = preference.CatalogID, preference.Model
+			} else if errors.Is(entitlementErr, basesvc.ErrForbidden) {
+				// A revoked grant must restore a usable default rather than trapping
+				// a caller on an inaccessible preference.
+				if err := q.DeleteAgentUserModelPreference(ctx, dbq.DeleteAgentUserModelPreferenceParams{AgentID: pgAgentID, UserID: toPgUUID(preferenceUserID)}); err != nil {
+					return ResolvedModel{}, fmt.Errorf("clear unavailable caller model preference: %w", err)
+				}
+			} else {
+				return ResolvedModel{}, fmt.Errorf("check caller model preference entitlement: %w", entitlementErr)
+			}
+		}
+	}
 
 	if slug != "" {
 		slot, slotErr := q.GetAgentModelSlot(ctx, dbq.GetAgentModelSlotParams{
@@ -145,6 +184,46 @@ func (h *Service) ResolveModel(ctx context.Context, agentID, slug, capability st
 		SupportsStructuredOutputs: supportsStructuredOutputs,
 		Reasoning:                 reasoning,
 	}, nil
+}
+
+// UserTextModelPreference is a validated caller-scoped text-model choice.
+type UserTextModelPreference struct {
+	Model      string
+	ProviderID uuid.UUID
+}
+
+// SetUserTextModel stores a caller preference only after confirming the model
+// exists on the agent's text provider and is entitled for that caller.
+func (h *Service) SetUserTextModel(ctx context.Context, principal authz.Principal, agentID, userID uuid.UUID, model string) (UserTextModelPreference, error) {
+	model = strings.TrimSpace(model)
+	if model == "" || len(model) > 120 || userID == uuid.Nil {
+		return UserTextModelPreference{}, basesvc.Detail(basesvc.ErrInvalidInput, "model must contain 1..120 characters for a signed-in user")
+	}
+	q := dbq.New(h.db.Pool())
+	pgAgentID := toPgUUID(agentID)
+	providerID, _, err := h.ModelForCapability(ctx, q, pgAgentID, "text")
+	if err != nil {
+		return UserTextModelPreference{}, err
+	}
+	if !providerID.Valid {
+		return UserTextModelPreference{}, basesvc.Detail(basesvc.ErrInvalidInput, "no text model provider is configured for this agent")
+	}
+	if _, err := q.GetProviderModel(ctx, dbq.GetProviderModelParams{ConfiguredProviderID: providerID, ModelID: model}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return UserTextModelPreference{}, basesvc.Detail(basesvc.ErrInvalidInput, "model %q is not configured for this agent", model)
+		}
+		return UserTextModelPreference{}, fmt.Errorf("get selectable text model: %w", err)
+	}
+	if err := modelssvc.CheckEntitled(ctx, q, principal, providerID, model); err != nil {
+		return UserTextModelPreference{}, err
+	}
+	row, err := q.UpsertAgentUserModelPreference(ctx, dbq.UpsertAgentUserModelPreferenceParams{
+		AgentID: pgAgentID, UserID: toPgUUID(userID), CatalogID: providerID, Model: model,
+	})
+	if err != nil {
+		return UserTextModelPreference{}, fmt.Errorf("save caller model preference: %w", err)
+	}
+	return UserTextModelPreference{Model: row.Model, ProviderID: uuid.UUID(row.CatalogID.Bytes)}, nil
 }
 
 // modelForCapability picks the model for a capability using the tier-2 and

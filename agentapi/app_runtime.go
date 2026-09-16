@@ -119,6 +119,27 @@ func (h *Handler) SessionLoadCurrent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+func (h *Handler) SetCurrentUserTextModel(w http.ResponseWriter, r *http.Request) {
+	runID, err := parseUUID(r.Header.Get("X-Airlock-Run-ID"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid run ID")
+		return
+	}
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := readAppJSON(r, &req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	result, err := h.appService().SetCurrentUserTextModel(callbackContext(r), runID, req.Model)
+	if err != nil {
+		h.appError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
 func (h *Handler) SessionLoad(w http.ResponseWriter, r *http.Request) {
 	convID, err := parseUUID(chi.URLParam(r, "convID"))
 	if err != nil {

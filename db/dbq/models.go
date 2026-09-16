@@ -456,6 +456,14 @@ type AgentTopic struct {
 	PerUser     bool               `json:"per_user"`
 }
 
+type AgentUserModelPreference struct {
+	AgentID   pgtype.UUID        `json:"agent_id"`
+	UserID    pgtype.UUID        `json:"user_id"`
+	CatalogID pgtype.UUID        `json:"provider_id"`
+	Model     string             `json:"model"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
 type AgentWebhook struct {
 	ID             pgtype.UUID        `json:"id"`
 	AgentID        pgtype.UUID        `json:"agent_id"`

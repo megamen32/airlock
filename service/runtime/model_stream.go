@@ -24,7 +24,14 @@ func (h *Service) RuntimeModel(ctx context.Context, agentID, runID uuid.UUID, sl
 	if err != nil {
 		return nil, err
 	}
-	resolved, err := h.ResolveModel(ctx, agentID.String(), slug, capability)
+	userID := uuid.Nil
+	if user := admitted.Runtime.Caller.User; user != nil {
+		userID, err = uuid.Parse(user.ID)
+		if err != nil {
+			return nil, errors.New("runtime caller has an invalid user ID")
+		}
+	}
+	resolved, err := h.ResolveModelForUser(ctx, agentID.String(), slug, capability, userID, admitted.Principal)
 	if err != nil {
 		return nil, err
 	}
