@@ -302,7 +302,46 @@ func (c *S3Client) CopyObject(ctx context.Context, srcKey, dstKey string) error 
 		CopySource: &copySource,
 		Key:        &dstKey,
 	})
-	return err
+	if err == nil || !IsNotFound(err) {
+		return err
+	}
+
+	// Some S3-compatible endpoints report NoSuchKey for CopyObject even when
+	// the source object exists. Probe the source first so a genuinely missing
+	// object still returns the original copy error, then stream a safe fallback.
+	source, contentType, headErr := c.HeadObject(ctx, srcKey)
+	if headErr != nil {
+		return err
+	}
+	reader, readErr := c.GetObject(ctx, srcKey)
+	if readErr != nil {
+		return err
+	}
+	defer reader.Close()
+
+	temporary, tempErr := os.CreateTemp("", "airlock-copy-*")
+	if tempErr != nil {
+		return fmt.Errorf("copy fallback create temporary file: %w", tempErr)
+	}
+	defer func() {
+		temporary.Close()
+		os.Remove(temporary.Name())
+	}()
+	if copied, copyErr := io.Copy(temporary, reader); copyErr != nil {
+		return fmt.Errorf("copy fallback read source: %w", copyErr)
+	} else if copied != source.Size {
+		return fmt.Errorf("copy fallback source size = %d, want %d", copied, source.Size)
+	}
+	if _, seekErr := temporary.Seek(0, io.SeekStart); seekErr != nil {
+		return fmt.Errorf("copy fallback rewind source: %w", seekErr)
+	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	if putErr := c.PutObjectStream(ctx, dstKey, temporary, source.Size, contentType); putErr != nil {
+		return fmt.Errorf("copy fallback write destination: %w", putErr)
+	}
+	return nil
 }
 
 // ConditionalCopyObject publishes a verified staging object only if both the
