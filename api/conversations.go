@@ -666,17 +666,21 @@ func (h *conversationsHandler) NotifyUpgradeComplete(ctx context.Context, agentI
 }
 
 // UploadFile handles POST /api/v1/agents/{agentID}/files — multipart file
-// upload. Stores the file under "/tmp/{uuid}-{filename}" in the agent's
-// path namespace and persists the original filename as S3 metadata so the
-// LLM can refer to "Q1 Report.pdf" while the path uses a UUID-prefixed
-// safe form.
+// upload. Stores the file in the framework-owned, user-scoped incoming
+// namespace. That lets the current run read its own attachment while keeping
+// it unavailable to another member who guesses the object name.
 func (h *conversationsHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
 	agentID, err := parseUUID(chi.URLParam(r, "agentID"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid agent ID")
 		return
 	}
-	if err := h.svc.Authorize(r.Context(), principalFromRequest(r), agentID); err != nil {
+	principal := principalFromRequest(r)
+	if principal.UserID == uuid.Nil {
+		writeError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	if err := h.svc.Authorize(r.Context(), principal, agentID); err != nil {
 		writeConvError(w, err, "failed to authorize upload")
 		return
 	}
@@ -700,9 +704,8 @@ func (h *conversationsHandler) UploadFile(w http.ResponseWriter, r *http.Request
 		ct = "application/octet-stream"
 	}
 
-	rawPath := "tmp/" + uuid.New().String()[:8] + "-" + header.Filename
-	path, err := storage.CleanAgentPath(rawPath)
-	if err != nil || path != rawPath {
+	path, err := incomingUploadPath(principal.UserID, header.Filename)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid filename")
 		return
 	}
@@ -724,6 +727,21 @@ func (h *conversationsHandler) UploadFile(w http.ResponseWriter, r *http.Request
 		Size:         header.Size,
 		LastModified: time.Now(),
 	})
+}
+
+func incomingUploadPath(userID uuid.UUID, filename string) (string, error) {
+	if userID == uuid.Nil {
+		return "", errors.New("authenticated user is required")
+	}
+	if filename == "" || filename != filepath.Base(filename) || filename == "." || filename == ".." || strings.ContainsAny(filename, "\\\\\x00\r\n") {
+		return "", errors.New("invalid upload filename")
+	}
+	rawPath := "__incoming/user-" + userID.String() + "/" + uuid.New().String()[:8] + "-" + filename
+	path, err := storage.CleanAgentPath(rawPath)
+	if err != nil || path != rawPath {
+		return "", errors.New("invalid upload filename")
+	}
+	return path, nil
 }
 
 // --- helpers ---
