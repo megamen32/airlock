@@ -868,6 +868,7 @@ func NewRouter(cfg RouterConfig) *Router {
 		r.Get("/storage/*", ah.StorageLoad)
 		r.Delete("/storage/*", ah.StorageDelete)
 		r.Get("/storage", ah.StorageList)
+		r.Get("/session/current/messages", ah.SessionLoadCurrent)
 		r.Get("/session/{convID}/messages", ah.SessionLoad)
 		r.Post("/session/{convID}/messages", ah.SessionAppend)
 		r.Post("/session/{convID}/compact", ah.SessionCompact)

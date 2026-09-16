@@ -105,6 +105,20 @@ func (h *Handler) Print(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (h *Handler) SessionLoadCurrent(w http.ResponseWriter, r *http.Request) {
+	runID, err := parseUUID(r.Header.Get("X-Airlock-Run-ID"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid run ID")
+		return
+	}
+	result, err := h.appService().SessionLoadCurrent(callbackContext(r), runID)
+	if err != nil {
+		h.appError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
 func (h *Handler) SessionLoad(w http.ResponseWriter, r *http.Request) {
 	convID, err := parseUUID(chi.URLParam(r, "convID"))
 	if err != nil {
