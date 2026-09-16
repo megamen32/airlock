@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"path"
 	"strings"
 	"time"
 
@@ -215,8 +216,18 @@ func mediaPartNeedsPresign(partType, source, url string) bool {
 // callers treat it as "leave the part as-is," matching the behavior we had
 // when the two resolver functions each contained their own try/log/continue
 // block.
-func presignSource(ctx context.Context, s3Client *storage.S3Client, logger *zap.Logger, source string) string {
-	url, err := s3Client.PublicPresignGetURL(ctx, source, 15*time.Minute)
+func presignSource(ctx context.Context, s3Client *storage.S3Client, logger *zap.Logger, source, partType, filename, mimeType string) string {
+	var url string
+	var err error
+	inlineMedia := strings.HasPrefix(mimeType, "image/") || strings.HasPrefix(mimeType, "audio/") || strings.HasPrefix(mimeType, "video/")
+	if partType == "file" && !inlineMedia {
+		if filename == "" {
+			filename = path.Base(source)
+		}
+		url, err = s3Client.PublicPresignDownloadURL(ctx, source, filename, 15*time.Minute)
+	} else {
+		url, err = s3Client.PublicPresignGetURL(ctx, source, 15*time.Minute)
+	}
 	if err != nil {
 		logger.Error("presign S3 URL", zap.String("source", source), zap.Error(err))
 		return ""
@@ -238,7 +249,7 @@ func resolveDisplayParts(ctx context.Context, s3Client *storage.S3Client, logger
 		if !mediaPartNeedsPresign(p.Type, p.Source, p.URL) {
 			continue
 		}
-		if url := presignSource(ctx, s3Client, logger, p.Source); url != "" {
+		if url := presignSource(ctx, s3Client, logger, p.Source, p.Type, p.Filename, p.MimeType); url != "" {
 			p.URL = url
 		}
 	}
@@ -262,9 +273,11 @@ func ResolveMediaPartsJSON(ctx context.Context, s3Client *storage.S3Client, logg
 	for i, elem := range raw {
 		// Peek at the type and source to decide if this part needs resolution.
 		var peek struct {
-			Type   string `json:"type"`
-			Source string `json:"source"`
-			URL    string `json:"url"`
+			Type     string `json:"type"`
+			Source   string `json:"source"`
+			URL      string `json:"url"`
+			Filename string `json:"filename"`
+			MimeType string `json:"mimeType"`
 		}
 		if json.Unmarshal(elem, &peek) != nil {
 			continue
@@ -272,7 +285,7 @@ func ResolveMediaPartsJSON(ctx context.Context, s3Client *storage.S3Client, logg
 		if !mediaPartNeedsPresign(peek.Type, peek.Source, peek.URL) {
 			continue
 		}
-		url := presignSource(ctx, s3Client, logger, peek.Source)
+		url := presignSource(ctx, s3Client, logger, peek.Source, peek.Type, peek.Filename, peek.MimeType)
 		if url == "" {
 			continue
 		}
