@@ -718,6 +718,7 @@ func NewRouter(cfg RouterConfig) *Router {
 		r.Get("/conversations/feed", cH.FeedConversations)
 		r.Get("/conversations/{convID}", cH.GetConversation)
 		r.Get("/conversations/{convID}/messages", cH.ListConversationMessages)
+		r.Get("/conversations/{convID}/files", cH.DownloadConversationFile)
 		r.Delete("/conversations/{convID}", cH.DeleteConversation)
 		r.Get("/conversations/{convID}/topics", cH.ListTopics)
 		r.Post("/conversations/{convID}/topics/{slug}/subscribe", cH.SubscribeTopic)

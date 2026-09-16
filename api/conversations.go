@@ -781,7 +781,8 @@ func messageToProto(ctx context.Context, s3Client *storage.S3Client, logger *zap
 		RunId:        convert.PgUUIDToString(m.RunID),
 	}
 	if len(m.Parts) > 0 {
-		info.Parts = string(runtimesvc.ResolveMediaPartsJSON(ctx, s3Client, logger, m.Parts))
+		resolved := runtimesvc.ResolveMediaPartsJSON(ctx, s3Client, logger, m.Parts)
+		info.Parts = string(runtimesvc.ConversationFileURLs(resolved, convert.PgUUIDToString(m.ConversationID)))
 	}
 	return info
 }

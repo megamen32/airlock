@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"net/url"
 	"path"
 	"strings"
 	"time"
@@ -121,7 +122,7 @@ func PostToConversation(ctx context.Context, deps PostDeps, opts PostOpts) error
 		agentIDStr := opts.AgentID.String()
 		convIDStr := opts.ConversationID.String()
 		// Resolve S3 keys to presigned URLs so the browser can load media directly.
-		resolvedJSON := ResolveMediaPartsJSON(ctx, deps.S3, deps.Logger, partsJSON)
+		resolvedJSON := ConversationFileURLs(ResolveMediaPartsJSON(ctx, deps.S3, deps.Logger, partsJSON), convIDStr)
 		// ConversationID must ride on the ENVELOPE (not just the payload): the
 		// web client's address gate adopts a brand-new thread only when the
 		// envelope carries it (chat store onRunMessage). Without it the first
@@ -312,4 +313,32 @@ func ResolveMediaPartsJSON(ctx context.Context, s3Client *storage.S3Client, logg
 		return partsJSON
 	}
 	return out
+}
+
+// ConversationFileURLs routes file downloads through the owner-authorized
+// conversation API. Some S3-compatible stores ignore response disposition
+// overrides; the app must still offer a working browser download.
+func ConversationFileURLs(raw []byte, conversationID string) []byte {
+	if _, err := uuid.Parse(conversationID); err != nil {
+		return raw
+	}
+	var parts []map[string]json.RawMessage
+	if json.Unmarshal(raw, &parts) != nil {
+		return raw
+	}
+	for _, p := range parts {
+		var kind, source, mimeType string
+		_ = json.Unmarshal(p["type"], &kind)
+		_ = json.Unmarshal(p["source"], &source)
+		_ = json.Unmarshal(p["mimeType"], &mimeType)
+		if kind != "file" || !strings.HasPrefix(source, "agents/") || strings.HasPrefix(mimeType, "image/") || strings.HasPrefix(mimeType, "audio/") || strings.HasPrefix(mimeType, "video/") {
+			continue
+		}
+		p["url"], _ = json.Marshal("/api/v1/conversations/" + conversationID + "/files?source=" + url.QueryEscape(source))
+	}
+	encoded, err := json.Marshal(parts)
+	if err != nil {
+		return raw
+	}
+	return encoded
 }
