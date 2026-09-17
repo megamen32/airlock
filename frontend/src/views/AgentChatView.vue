@@ -669,6 +669,7 @@ function formatTokens(n: number): string {
                       :force-expanded="chat.pendingConfirmation?.toolCallId === b.toolCallId"
                     />
                     <div v-if="chat.pendingConfirmation?.toolCallId === b.toolCallId" class="confirmation-box">
+                      <p v-if="chat.pendingConfirmation.description" style="white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 0 0.75rem">{{ chat.pendingConfirmation.description }}</p>
                       <div style="display: flex; align-items: center; justify-content: space-between">
                         <span style="font-size: 0.8rem; font-weight: 500">{{ t('chat.confirmation.allowAction') }}</span>
                         <div style="display: flex; gap: 0.5rem">
@@ -732,6 +733,7 @@ function formatTokens(n: number): string {
                   <!-- Inline confirmation — the user is being asked to
                        approve THIS tool call; keep it always visible. -->
                   <div v-if="chat.pendingConfirmation && chat.pendingConfirmation.toolCallId === entry.tc.toolCallId" class="confirmation-box">
+                    <p v-if="chat.pendingConfirmation.description" style="white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 0 0.75rem">{{ chat.pendingConfirmation.description }}</p>
                     <div style="display: flex; align-items: center; justify-content: space-between">
                       <span style="font-size: 0.8rem; font-weight: 500">{{ t('chat.confirmation.allowAction') }}</span>
                       <div style="display: flex; gap: 0.5rem">
