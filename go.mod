@@ -1,6 +1,6 @@
 module github.com/airlockrun/airlock
 
-replace github.com/airlockrun/agentsdk => github.com/megamen32/agentsdk v0.7.0-rc.2.0.20260916234940-05bc95a68908
+replace github.com/airlockrun/agentsdk => github.com/megamen32/agentsdk v0.7.0-rc.2.0.20260917001933-7c038b3688a9
 
 go 1.26.6
 
