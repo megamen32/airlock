@@ -142,6 +142,26 @@ func (h *Handler) CancelJob(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (h *Handler) RetryJob(w http.ResponseWriter, r *http.Request) {
+	jobID, err := canonicalJobUUID(chi.URLParam(r, "jobID"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid job ID")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	var body map[string]any
+	if err := readJSON(r, &body); err != nil || body == nil || len(body) != 0 {
+		writeJSONError(w, http.StatusBadRequest, "retry requires an empty object; original execution origin is immutable")
+		return
+	}
+	job, err := h.jobs.RetryForAgent(r.Context(), auth.AgentIDFromContext(r.Context()), jobID)
+	if err != nil {
+		writeAgentJobError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, wire.GetJobResponse{Job: jobToWire(job)})
+}
+
 func jobToWire(job dbq.AgentJob) wire.JobInfo {
 	return wire.JobInfo{
 		ID:               pgUUID(job.ID).String(),

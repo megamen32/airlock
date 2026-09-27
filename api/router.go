@@ -889,6 +889,7 @@ func NewRouter(cfg RouterConfig) *Router {
 		r.Get("/jobs/{jobID}", ah.GetJob)
 		r.Put("/jobs/{jobID}/progress", ah.UpdateJobProgress)
 		r.Delete("/jobs/{jobID}", ah.CancelJob)
+		r.Post("/jobs/{jobID}/retry", ah.RetryJob)
 		r.Post("/topic/{slug}/subscribe", ah.TopicSubscribe)
 		r.Delete("/topic/{slug}/subscribe", ah.TopicUnsubscribe)
 		r.Post("/mcp/{slug}/tools/call", ah.MCPToolCall)

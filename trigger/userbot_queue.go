@@ -90,6 +90,21 @@ func userbotWait(ctx context.Context) bool {
 // replacement poller waits for its predecessor to finish before classifying any
 // started receipt as interrupted. Cancel requests have an independent lane.
 func (m *BridgeManager) runUserbotInbox(ctx context.Context, br dbq.Bridge) {
+	m.superviseUserbotInbox(ctx, br, m.HandleEvent)
+}
+
+func (m *BridgeManager) superviseUserbotInbox(ctx context.Context, br dbq.Bridge, handle func(context.Context, BridgeEvent) error) {
+	for ctx.Err() == nil {
+		m.runUserbotInboxOnce(ctx, br, handle)
+		if !userbotWait(ctx) {
+			return
+		}
+	}
+}
+
+func (m *BridgeManager) runUserbotInboxOnce(parent context.Context, br dbq.Bridge, handle func(context.Context, BridgeEvent) error) {
+	ctx, stopWorkers := context.WithCancel(parent)
+	defer stopWorkers()
 	lease, err := m.db.Pool().Acquire(ctx)
 	if err != nil {
 		m.logger.Error("inbox lease", zap.Error(err))
@@ -161,13 +176,16 @@ func (m *BridgeManager) runUserbotInbox(ctx context.Context, br dbq.Bridge) {
 					}
 					continue
 				}
-				runErr := m.HandleEvent(ctx, ev)
+				runErr := handle(ctx, ev)
 				finishCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				err = m.finishUserbotEvent(finishCtx, br, seq, runErr)
 				cancel()
 				if err != nil {
-					// Never continue past an ambiguous completion receipt.
-					m.logger.Error("persist inbox outcome; worker stopped", zap.Error(err))
+					// Stop both lanes and release the lease before recovery. The
+					// supervisor marks this ambiguous event interrupted and then
+					// resumes later pending events, never re-running this one.
+					m.logger.Error("persist inbox outcome; restarting workers", zap.Error(err))
+					stopWorkers()
 					return
 				}
 				if runErr != nil {

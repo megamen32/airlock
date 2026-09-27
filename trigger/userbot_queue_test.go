@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -169,6 +170,51 @@ func TestUserbotDurableInbox(t *testing.T) {
 	}
 	if deliveries != 1 || len(keys) != 1 {
 		t.Fatalf("ambiguous retry duplicated HTTP relay delivery: %d", deliveries)
+	}
+	// A completion-write outage must stop BOTH lanes, recover the ambiguous
+	// first event as interrupted, and resume the next event without restart.
+	br.Config = []byte(`{"after":6}`)
+	if err = m.stageUserbotEvents(ctx, br, []BridgeEvent{event(5, "first ambiguous"), event(6, "later request")}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = database.Pool().Exec(ctx, `CREATE FUNCTION reject_first_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.seq=5 AND NEW.status='completed' THEN RAISE EXCEPTION 'simulated completion write outage'; END IF; RETURN NEW; END $$;
+CREATE TRIGGER reject_first_receipt BEFORE UPDATE ON userbot_inbox FOR EACH ROW EXECUTE FUNCTION reject_first_receipt()`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var firstCalls, secondCalls atomic.Int32
+	workerCtx, stopWorker := context.WithTimeout(ctx, 5*time.Second)
+	defer stopWorker()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.superviseUserbotInbox(workerCtx, br, func(_ context.Context, ev BridgeEvent) error {
+			if ev.Text == "first ambiguous" {
+				firstCalls.Add(1)
+			} else if ev.Text == "later request" {
+				secondCalls.Add(1)
+			} else {
+				t.Errorf("unexpected event %q", ev.Text)
+			}
+			return nil
+		})
+	}()
+	for workerCtx.Err() == nil {
+		if err = database.Pool().QueryRow(ctx, `SELECT status FROM userbot_inbox WHERE seq=6`).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status == "completed" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	stopWorker()
+	<-done
+	if status != "completed" || firstCalls.Load() != 1 || secondCalls.Load() != 1 {
+		t.Fatalf("worker did not recover: status=%s first=%d second=%d", status, firstCalls.Load(), secondCalls.Load())
+	}
+	if err = database.Pool().QueryRow(ctx, `SELECT status FROM userbot_inbox WHERE seq=5`).Scan(&status); err != nil || status != "interrupted" {
+		t.Fatalf("ambiguous first event replayed: %s %v", status, err)
 	}
 }
 
