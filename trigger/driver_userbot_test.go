@@ -1,6 +1,7 @@
 package trigger
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -14,6 +15,153 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
+
+func TestUserbotExportedFileDownloadsStorageWithoutRelayCredential(t *testing.T) {
+	data := []byte("native exported report")
+	storageCalls, relayCalls := 0, 0
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		storageCalls++
+		if r.Header.Get("Authorization") != "" {
+			t.Error("relay credential leaked to storage")
+		}
+		if r.URL.Query().Get("signature") != "presigned-test" {
+			t.Error("presigned query lost")
+		}
+		w.Write(data)
+	}))
+	defer storage.Close()
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		relayCalls++
+		if r.Header.Get("Authorization") != "Bearer test-relay-token" {
+			t.Error("missing relay credential")
+		}
+		var body struct {
+			Data     []byte `json:"dataBase64"`
+			Filename string `json:"filename"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(body.Data, data) || body.Filename != "report.md" {
+			t.Error("exported file changed")
+		}
+		w.Write([]byte(`{"delivered":true}`))
+	}))
+	defer relay.Close()
+	driver := &UserbotDriver{baseURL: relay.URL, client: relay.Client(), storageOrigin: storage.URL}
+	err := driver.SendParts(context.Background(), relayTestBridge(), "123", []wire.DisplayPart{{Type: "file", Filename: "report.md", URL: storage.URL + "/bucket/report?signature=presigned-test"}})
+	if err != nil || storageCalls != 1 || relayCalls != 1 {
+		t.Fatalf("storage=%d relay=%d err=%v", storageCalls, relayCalls, err)
+	}
+}
+
+func TestUserbotExportRejectsUnknownOriginBeforeNetwork(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; w.Write([]byte("untrusted")) }))
+	defer server.Close()
+	driver := &UserbotDriver{baseURL: server.URL, client: server.Client(), storageOrigin: "https://configured-storage.invalid"}
+	err := driver.SendParts(context.Background(), relayTestBridge(), "123", []wire.DisplayPart{{Type: "file", URL: server.URL + "/private"}})
+	if err == nil || calls != 0 {
+		t.Fatalf("untrusted origin reached: calls=%d err=%v", calls, err)
+	}
+}
+
+func TestUserbotExportStorageFailureNeverCallsRelay(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusNotFound, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			relayCalls := 0
+			relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { relayCalls++ }))
+			defer relay.Close()
+			storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "SECRET signed storage error", status) }))
+			defer storage.Close()
+			driver := &UserbotDriver{baseURL: relay.URL, client: relay.Client(), storageOrigin: storage.URL}
+			err := driver.SendParts(context.Background(), relayTestBridge(), "123", []wire.DisplayPart{{Type: "file", URL: storage.URL + "/report"}})
+			if err == nil || relayCalls != 0 || strings.Contains(err.Error(), "SECRET") {
+				t.Fatalf("relay=%d err=%v", relayCalls, err)
+			}
+		})
+	}
+}
+
+func TestUserbotExportDoesNotFollowRedirect(t *testing.T) {
+	targetCalls := 0
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { targetCalls++ }))
+	defer target.Close()
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, target.URL, http.StatusFound) }))
+	defer storage.Close()
+	driver := &UserbotDriver{baseURL: target.URL, client: target.Client(), storageOrigin: storage.URL}
+	err := driver.SendParts(context.Background(), relayTestBridge(), "123", []wire.DisplayPart{{Type: "file", URL: storage.URL + "/report"}})
+	if err == nil || targetCalls != 0 {
+		t.Fatalf("redirect followed: calls=%d err=%v", targetCalls, err)
+	}
+}
+
+func TestUserbotPollRetrievesDurableFileReference(t *testing.T) {
+	ref := strings.Repeat("a", 64)
+	data := []byte("durable attachment")
+	fileCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-relay-token" {
+			t.Error("unauthenticated file reference")
+		}
+		if r.URL.Path == "/events" {
+			json.NewEncoder(w).Encode(map[string]any{"nextCursor": 5, "events": []userbotEvent{{Seq: 5, MessageID: "20", ChatID: "123", SenderID: "123", Direct: true, Files: []userbotFile{{Filename: "photo.jpg", FileRef: ref}}}}})
+			return
+		}
+		if r.URL.Path != "/files/"+ref {
+			t.Errorf("wrong file URL: %s", r.URL.Path)
+		}
+		fileCalls++
+		w.Write(data)
+	}))
+	defer server.Close()
+	driver := &UserbotDriver{baseURL: server.URL, client: server.Client()}
+	br := relayTestBridge()
+	events, err := driver.Poll(context.Background(), &br)
+	if err != nil || len(events) != 1 || fileCalls != 1 {
+		t.Fatalf("events=%d fileCalls=%d err=%v", len(events), fileCalls, err)
+	}
+	if !bytes.Equal(events[0].Files[0].Data, data) || events[0].Files[0].Size != int64(len(data)) {
+		t.Fatal("reference bytes not hydrated")
+	}
+}
+
+func TestUserbotFileReferenceFailureKeepsCursor(t *testing.T) {
+	for _, ref := range []string{strings.Repeat("b", 64), "../../secret", strings.Repeat("z", 64)} {
+		t.Run(ref[:8], func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/events" {
+					json.NewEncoder(w).Encode(map[string]any{"nextCursor": 5, "events": []userbotEvent{{Seq: 5, MessageID: "20", ChatID: "123", SenderID: "123", Direct: true, Files: []userbotFile{{Filename: "photo.jpg", FileRef: ref}}}}})
+					return
+				}
+				calls++
+				http.Error(w, "missing", http.StatusNotFound)
+			}))
+			defer server.Close()
+			driver := &UserbotDriver{baseURL: server.URL, client: server.Client()}
+			br := relayTestBridge()
+			before := string(br.Config)
+			events, err := driver.Poll(context.Background(), &br)
+			if err == nil || len(events) != 0 || string(br.Config) != before {
+				t.Fatal("failed attachment advanced cursor")
+			}
+			if ref != strings.Repeat("b", 64) && calls != 0 {
+				t.Fatal("invalid reference triggered file request")
+			}
+		})
+	}
+}
+
+func TestUserbotDeliveryKeyDoesNotChangeWhenRetriedModelTextChanges(t *testing.T) {
+	ctx := context.WithValue(context.Background(), relayIncomingKey{}, "bridge:123:20")
+	if relayDeliveryKey(ctx, "123:0", "original") != relayDeliveryKey(ctx, "123:0", "regenerated") {
+		t.Fatal("changed model output bypasses same-delivery receipt")
+	}
+	if relayDeliveryKey(ctx, "123:0", "same") == relayDeliveryKey(ctx, "123:1", "same") {
+		t.Fatal("separate delivery parts collide")
+	}
+}
 
 func relayTestBridge() dbq.Bridge {
 	return dbq.Bridge{ID: pgtype.UUID{Bytes: uuid.New(), Valid: true}, Type: "telegram_userbot", BotTokenRef: "test-relay-token", Config: []byte(`{"after":4}`)}
