@@ -1,12 +1,8 @@
 package agentapi
 
 import (
-	"net/http"
-
-	"github.com/airlockrun/airlock/auth"
+	"github.com/airlockrun/agentsdk/wire"
 	"github.com/airlockrun/airlock/db/dbq"
-	"github.com/jackc/pgx/v5/pgtype"
-	"go.uber.org/zap"
 )
 
 // agentMember is a principal granted access to the authenticated agent. A
@@ -23,18 +19,23 @@ type listMembersResponse struct {
 	Members []agentMember `json:"members"`
 }
 
-// ListMembers handles GET /api/agent/members. AgentMiddleware authenticates
-// the calling agent, and its ID is the only scope used for the grant query.
-func (h *Handler) ListMembers(w http.ResponseWriter, r *http.Request) {
-	agentID := auth.AgentIDFromContext(r.Context())
-	q := dbq.New(h.db.Pool())
-	rows, err := q.ListAgentGrants(r.Context(), pgtype.UUID{Bytes: agentID, Valid: true})
-	if err != nil {
-		h.logger.Error("list agent members", zap.Error(err))
-		writeJSONError(w, http.StatusInternalServerError, "list agent members failed")
-		return
+// Keep the flat roster fields consumed by already-deployed pre-0.7 agents
+// alongside the upstream user/access representation and pagination.
+func compatibleMembers(result wire.ListMembersResponse) any {
+	type member struct {
+		wire.Member
+		ID   string `json:"id"`
+		Kind string `json:"kind"`
+		Role string `json:"role"`
 	}
-	writeJSON(w, http.StatusOK, listMembersResponse{Members: agentMembers(rows)})
+	members := make([]member, len(result.Members))
+	for i, item := range result.Members {
+		members[i] = member{Member: item, ID: item.User.ID, Kind: "user", Role: string(item.Access)}
+	}
+	return struct {
+		Members    []member `json:"members"`
+		NextCursor string   `json:"nextCursor,omitempty"`
+	}{members, result.NextCursor}
 }
 
 func agentMembers(rows []dbq.ListAgentGrantsRow) []agentMember {

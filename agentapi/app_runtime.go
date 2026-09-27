@@ -81,7 +81,7 @@ func (h *Handler) ListMembers(w http.ResponseWriter, r *http.Request) {
 		h.appError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, result)
+	writeJSON(w, http.StatusOK, compatibleMembers(result))
 }
 
 func (h *Handler) Sync(w http.ResponseWriter, r *http.Request) {

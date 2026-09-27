@@ -1,12 +1,36 @@
 package agentapi
 
 import (
+	"encoding/json"
 	"testing"
 
+	"github.com/airlockrun/agentsdk/wire"
 	"github.com/airlockrun/airlock/db/dbq"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
+
+func TestMembersCompatibilityPreservesOldAndNewSDKResponses(t *testing.T) {
+	input := wire.ListMembersResponse{Members: []wire.Member{{User: wire.MemberUser{ID: "user-id", DisplayName: "Member"}, Access: wire.Access("admin")}}, NextCursor: "cursor"}
+	data, err := json.Marshal(compatibleMembers(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var current wire.ListMembersResponse
+	if err := json.Unmarshal(data, &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.NextCursor != input.NextCursor || current.Members[0].User.ID != "user-id" {
+		t.Fatalf("lost current fields: %s", data)
+	}
+	var legacy listMembersResponse
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Members[0] != (agentMember{ID: "user-id", Kind: "user", Role: "admin"}) {
+		t.Fatalf("lost legacy fields: %s", data)
+	}
+}
 
 func TestAgentMembersReturnsOnlySafeRosterFields(t *testing.T) {
 	userID := uuid.MustParse("4d9c4eb3-5661-4a8f-bcde-ea6f47988ea6")
