@@ -112,9 +112,17 @@ func (s *MCPServer) listTools(ctx context.Context, access *mcpaccess.Service, ta
 	}
 	tools := make([]*mcp.Tool, 0, len(rows))
 	for _, row := range rows {
-		tools = append(tools, &mcp.Tool{Name: row.Name, Description: row.Description, InputSchema: row.InputSchema, OutputSchema: row.OutputSchema})
+		tools = append(tools, nativeMCPTool(row.Name, row.Description, row.InputSchema, row.OutputSchema))
 	}
 	return &mcp.ListToolsResult{Tools: tools, Cacheable: mcp.Cacheable{CacheScope: "private"}}, nil
+}
+
+func nativeMCPTool(name, description string, input, output []byte) *mcp.Tool {
+	t := &mcp.Tool{Name: name, Description: description, InputSchema: json.RawMessage(input)}
+	if len(output) > 0 {
+		t.OutputSchema = json.RawMessage(output)
+	}
+	return t
 }
 
 func (s *MCPServer) callTool(ctx context.Context, h *Handler, access *mcpaccess.Service, target dbq.Agent, principal MCPPrincipal, params *mcp.CallToolParamsRaw) (*mcp.CallToolResult, error) {
