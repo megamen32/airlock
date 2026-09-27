@@ -216,7 +216,8 @@ func runServe(_ []string) {
 	prompter := trigger.NewPromptProxy(dispatcher, database, s3Client, transcriptionResolver, cfg.AgentBaseURL, logger.Named("prompt-proxy"))
 	telegramDriver := trigger.NewTelegramDriver(logger.Named("telegram"))
 	drivers := map[string]trigger.BridgeDriver{
-		"telegram": telegramDriver,
+		"telegram":         telegramDriver,
+		"telegram_userbot": trigger.NewUserbotDriver(),
 	}
 	bridgeMgr := trigger.NewBridgeManager(drivers, prompter, database, secretStore, cfg.JWTSecret, cfg.PublicURL, cfg.AgentBaseURL, logger.Named("bridges"))
 	jobWorker := trigger.NewJobWorker(dispatcher, database, logger.Named("job-worker"))

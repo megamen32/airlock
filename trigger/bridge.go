@@ -613,6 +613,12 @@ func isCancelTap(e BridgeEvent) bool {
 
 // HandleEvent processes a parsed BridgeEvent — routes to agent via PromptProxy.
 func (m *BridgeManager) HandleEvent(ctx context.Context, event BridgeEvent) error {
+	if len(event.RawPayload) > 0 {
+		var relay userbotEvent
+		if json.Unmarshal(event.RawPayload, &relay) == nil && relay.Seq > 0 && relay.MessageID != "" {
+			ctx = context.WithValue(ctx, relayIncomingKey{}, event.BridgeID.String()+":"+relay.ChatID+":"+relay.MessageID)
+		}
+	}
 	q := dbq.New(m.db.Pool())
 	br, err := q.GetBridgeByID(ctx, toPgUUID(event.BridgeID))
 	if err != nil {
@@ -694,7 +700,34 @@ func (m *BridgeManager) HandleEvent(ctx context.Context, event BridgeEvent) erro
 		)
 		return nil
 	}
+	ctx = auth.WithBridgeIdentity(ctx, claims)
 	userID := authz.PrincipalFromClaims(claims).UserID
+	if br.Type == "telegram_userbot" {
+		var relay struct {
+			ShouldReply *bool `json:"shouldReply"`
+		}
+		if err := json.Unmarshal(event.RawPayload, &relay); err != nil {
+			return fmt.Errorf("invalid relay context: %w", err)
+		}
+		if relay.ShouldReply != nil && !*relay.ShouldReply && event.Callback == nil {
+			conv, err := q.GetOrCreateBridgeAuthedConversation(ctx, dbq.GetOrCreateBridgeAuthedConversationParams{
+				AgentID: toPgUUID(agentID), UserID: toPgUUID(userID), BridgeID: toPgUUID(event.BridgeID),
+				ExternalID: pgtype.Text{String: event.ExternalID, Valid: true}, Title: "Telegram group context",
+			})
+			if err != nil {
+				return fmt.Errorf("group context conversation: %w", err)
+			}
+			content := event.Text
+			if event.SenderName != "" {
+				content = event.SenderName + ": " + content
+			}
+			if len(event.Files) > 0 {
+				content += fmt.Sprintf("\n[%d attachments retained in relay inbox]", len(event.Files))
+			}
+			_, err = q.CreateMessage(ctx, dbq.CreateMessageParams{ConversationID: conv.ID, Role: "user", Content: content, Parts: []byte("[]"), Source: "group_context"})
+			return err
+		}
+	}
 
 	// Resolve effective echo for this conversation from the user's
 	// per-channel override, falling back to the driver default.
@@ -748,11 +781,12 @@ func (m *BridgeManager) HandleEvent(ctx context.Context, event BridgeEvent) erro
 		if cbErr != nil {
 			return fmt.Errorf("prompt proxy (callback): %w", cbErr)
 		}
-		return nil
+		return driverErr
 	}
 
 	// Route to prompt proxy — streams events into the channel.
 	_, err = m.prompter.HandleMessage(ctx, agentID, event.BridgeID, userID, event.ExternalID, true, event.Text, event.Files, event.ReferencedMessage, respEvents)
+	wg.Wait()
 	if err != nil {
 		return fmt.Errorf("prompt proxy: %w", err)
 	}
@@ -765,7 +799,7 @@ func (m *BridgeManager) HandleEvent(ctx context.Context, event BridgeEvent) erro
 			zap.Error(driverErr))
 	}
 
-	return nil
+	return driverErr
 }
 
 // isAuthCommand reports whether text is the /auth slash command,
@@ -785,6 +819,9 @@ func (m *BridgeManager) handleAuthCommand(ctx context.Context, br dbq.Bridge, dr
 	}
 	linkURL := buildAuthExternalURL(m.publicURL, m.hmacSecret, br.Type, pgUUID(br.ID).String(), event.SenderID)
 	msg := fmt.Sprintf("Click to link your Airlock account:\n%s", linkURL)
+	if dr, ok := driver.(*UserbotDriver); ok {
+		return dr.sendText(ctx, br, event.ExternalID, "Этот Telegram-аккаунт пока не связан с участником AirLock. Обратись к администратору для подключения.", relayDeliveryKey(ctx, event.ExternalID, "unlinked"))
+	}
 	if dr, ok := driver.(*TelegramDriver); ok {
 		chatID, _ := strconv.ParseInt(event.ExternalID, 10, 64)
 		if chatID == 0 {
@@ -835,6 +872,10 @@ func (m *BridgeManager) SendParts(ctx context.Context, bridgeID uuid.UUID, exter
 			return fmt.Errorf("invalid chat ID: %w", err)
 		}
 		return dr.SendParts(ctx, token, chatID, parts)
+	}
+	if dr, ok := driver.(*UserbotDriver); ok {
+		br.BotTokenRef = token
+		return dr.SendParts(ctx, br, externalID, parts)
 	}
 
 	return fmt.Errorf("driver %q does not support SendParts", br.Type)
@@ -921,6 +962,13 @@ func (m *BridgeManager) startPoller(parent context.Context, br dbq.Bridge) {
 		ctx := pollCtx
 		driver := m.drivers[br.Type]
 		var lastIdentityCheck time.Time // bot-identity getMe throttle (all bridges)
+		if br.Type == "telegram_userbot" {
+			m.wg.Add(1)
+			go func() {
+				defer m.wg.Done()
+				m.runUserbotInbox(ctx, br)
+			}()
+		}
 
 		// Run-starting events (messages, approve/deny taps) are handled one
 		// at a time by this worker — concurrent runs in a single
@@ -953,6 +1001,7 @@ func (m *BridgeManager) startPoller(parent context.Context, br dbq.Bridge) {
 			default:
 			}
 
+			previousConfig := append([]byte(nil), br.Config...)
 			events, err := driver.Poll(ctx, &br)
 			if err != nil {
 				if ctx.Err() != nil {
@@ -961,11 +1010,10 @@ func (m *BridgeManager) startPoller(parent context.Context, br dbq.Bridge) {
 				m.logger.Error("poll failed",
 					zap.String("bridge", br.Name),
 					zap.Error(err))
-				q := dbq.New(m.db.Pool())
-				_ = q.UpdateBridgeStatus(ctx, dbq.UpdateBridgeStatusParams{
-					ID:     br.ID,
-					Status: "error",
-				})
+				if br.Type != "telegram_userbot" {
+					q := dbq.New(m.db.Pool())
+					_ = q.UpdateBridgeStatus(ctx, dbq.UpdateBridgeStatusParams{ID: br.ID, Status: "error"})
+				}
 				// Back off before retrying. Jitter spreads out the retries
 				// when several bridges fail in the same instant (a local
 				// network blip drops every poller's TCP socket within ~1 ms
@@ -976,6 +1024,22 @@ func (m *BridgeManager) startPoller(parent context.Context, br dbq.Bridge) {
 				case <-ctx.Done():
 					return
 				case <-time.After(backoff):
+				}
+				continue
+			}
+
+			// Stage the whole batch and cursor atomically before acknowledging it.
+			// Delivery runs independently, so a later failure never replays prior work.
+			if br.Type == "telegram_userbot" {
+				if err := m.stageUserbotEvents(ctx, br, events); err != nil {
+					br.Config = previousConfig
+					m.logger.Error("stage userbot inbox", zap.Error(err))
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(5 * time.Second):
+					}
+					continue
 				}
 				continue
 			}

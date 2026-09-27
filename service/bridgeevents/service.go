@@ -73,7 +73,7 @@ func pgID(id uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: id, Valid: true}
 // and target app. expectedUserID is a consistency assertion, never an identity
 // source; the linked platform account supplies the principal.
 func AdmitPrompt(ctx context.Context, q *dbq.Queries, agentID, bridgeID, expectedUserID uuid.UUID, chatID string) (authz.Principal, error) {
-	claims, err := auth.AdmitBridge(ctx, q, bridgeID, chatID, chatID)
+	claims, err := auth.AdmitBridgeConversation(ctx, q, bridgeID, chatID)
 	if err != nil {
 		return authz.Principal{}, err
 	}

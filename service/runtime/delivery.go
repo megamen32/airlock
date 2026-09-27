@@ -33,6 +33,11 @@ type PostDeps struct {
 	Logger     *zap.Logger
 }
 
+type keyedBridgeDeliverer interface {
+	SupportsOutputOnce(context.Context, uuid.UUID) bool
+	SendPartsOnce(context.Context, uuid.UUID, string, string, []wire.DisplayPart) error
+}
+
 // PostOpts configures a message post to a conversation.
 type PostOpts struct {
 	IdempotencyKey string // optional native text-only persistence key; scoped to agent+conversation
@@ -78,8 +83,16 @@ func PostToConversation(ctx context.Context, deps PostDeps, opts PostOpts) error
 			return err
 		}
 	}
-	if opts.IdempotencyKey != "" && (conv.Source == "bridge" || opts.TriggerLLM) {
-		return errors.New("idempotent output supports native conversations without LLM triggering only")
+	if opts.IdempotencyKey != "" && opts.TriggerLLM {
+		return errors.New("idempotent output does not trigger another LLM run")
+	}
+	var keyedBridge keyedBridgeDeliverer
+	if opts.IdempotencyKey != "" && conv.Source == "bridge" {
+		var ok bool
+		keyedBridge, ok = deps.BridgeMgr.(keyedBridgeDeliverer)
+		if !isBridge || !ok || !keyedBridge.SupportsOutputOnce(ctx, pgUUID(conv.BridgeID)) {
+			return errors.New("bridge does not support idempotent delivery")
+		}
 	}
 
 	// Build text summary if not provided.
@@ -111,7 +124,7 @@ func PostToConversation(ctx context.Context, deps PostDeps, opts PostOpts) error
 		if err != nil {
 			return err
 		}
-		if !inserted {
+		if !inserted && keyedBridge == nil {
 			return nil
 		}
 	} else if _, err := q.CreateMessage(ctx, dbq.CreateMessageParams{
@@ -130,7 +143,10 @@ func PostToConversation(ctx context.Context, deps PostDeps, opts PostOpts) error
 	if isBridge {
 		bridgeID := pgUUID(conv.BridgeID)
 		// Resolve S3 sources to presigned URLs for bridge delivery.
-		bridgeParts := resolveDisplayParts(ctx, deps.S3, deps.Logger, opts.Parts)
+		bridgeParts := resolveDisplayParts(ctx, deps.S3, deps.Logger, parts)
+		if keyedBridge != nil {
+			return keyedBridge.SendPartsOnce(ctx, bridgeID, conv.ExternalID.String, opts.AgentID.String()+":"+opts.ConversationID.String()+":"+opts.IdempotencyKey, bridgeParts)
+		}
 		if err := deps.BridgeMgr.SendParts(ctx, bridgeID, conv.ExternalID.String, bridgeParts); err != nil {
 			deps.Logger.Error("bridge delivery failed", zap.Error(err))
 			return err
