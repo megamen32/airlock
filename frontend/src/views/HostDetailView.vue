@@ -1,16 +1,19 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
+import { useConfirm } from 'primevue/useconfirm'
 import { useToast } from 'primevue/usetoast'
 import type { GetHostResponse } from '@/gen/airlock/v1/api_pb'
 import type { ConnectorInfo } from '@/gen/airlock/v1/types_pb'
-import { getHost, requestRemove, requestRollback, requestShell } from '@/api/hosts'
+import { deleteHost, getHost, requestRemove, requestRollback, requestShell } from '@/api/hosts'
 import { useNow } from '@/composables/useNow'
 import { useAirlockI18n } from '@/i18n'
 import { hasCapability } from '@/utils/resources'
 import { connectorReadiness, hostStatus, isHostStale } from '@/utils/connectors'
 
 const route = useRoute()
+const router = useRouter()
+const confirm = useConfirm()
 const toast = useToast()
 const { t } = useAirlockI18n()
 const detail = ref<GetHostResponse | null>(null)
@@ -24,8 +27,10 @@ const now = useNow()
 const host = computed(() => detail.value?.host)
 const stale = computed(() => !host.value || isHostStale(host.value.lastSeenAt, now.value))
 const canManage = computed(() => hasCapability(host.value?.capabilities ?? [], 'manage'))
+const canDelete = computed(() => canManage.value && stale.value)
 const canFull = computed(() => canManage.value && !stale.value && host.value?.accessMode === 'full')
-const canUpdate = computed(() => canManage.value && !stale.value && (host.value?.accessMode === 'full' || host.value?.accessMode === 'update_only'))
+const canRemove = computed(() => canManage.value && !stale.value && (host.value?.accessMode === 'full' || host.value?.accessMode === 'manage'))
+const canUpdate = computed(() => canRemove.value || (canManage.value && !stale.value && host.value?.accessMode === 'updates'))
 const status = computed(() => host.value ? hostStatus(host.value, now.value, t) : null)
 
 const capabilityMessageIds = {
@@ -58,7 +63,8 @@ function capabilityLabel(capability: string): string {
 
 function accessModeLabel(mode: string): string {
   if (mode === 'full') return t('connectors.host.access.full')
-  if (mode === 'update_only') return t('connectors.host.access.updateOnly')
+  if (mode === 'manage') return t('connectors.host.access.manage')
+  if (mode === 'updates') return t('connectors.host.access.updates')
   if (mode === 'none') return t('connectors.host.access.none')
   return mode
 }
@@ -120,6 +126,31 @@ async function rollback(connector: ConnectorInfo) {
   finally { saving.value = false }
 }
 
+function confirmDeleteHost() {
+  if (!host.value || !canDelete.value) return
+  const current = host.value
+  confirm.require({
+    header: t('connectors.host.detail.deleteHeader', { name: current.name }),
+    message: t('connectors.host.detail.deleteImpact'),
+    icon: 'pi pi-exclamation-triangle',
+    acceptLabel: t('connectors.host.detail.delete'),
+    rejectLabel: t('connectors.tab.cancel'),
+    acceptClass: 'p-button-danger',
+    accept: async () => {
+      saving.value = true
+      try {
+        await deleteHost(current.id)
+        toast.add({ severity: 'success', summary: t('connectors.host.detail.deleted'), life: 3000 })
+        await router.push({ name: 'resources' })
+      } catch (error: unknown) {
+        toast.add({ severity: 'error', summary: apiError(error, t('connectors.host.detail.deleteFailed')), life: 5000 })
+      } finally {
+        saving.value = false
+      }
+    },
+  })
+}
+
 onMounted(load)
 </script>
 
@@ -129,7 +160,7 @@ onMounted(load)
     <template v-else-if="host">
       <div class="heading">
         <div><h1>{{ host.name }}</h1><p>{{ host.platform }} / {{ host.architecture }} · airlock-host {{ host.version }}</p></div>
-        <div class="heading-tags"><Tag v-if="status" :value="status.label" :severity="status.severity" /><Tag :value="accessModeLabel(host.accessMode)" :severity="host.accessMode === 'full' ? 'success' : host.accessMode === 'update_only' ? 'warn' : 'secondary'" /></div>
+        <div class="heading-tags"><Tag v-if="status" :value="status.label" :severity="status.severity" /><Tag :value="accessModeLabel(host.accessMode)" :severity="host.accessMode === 'full' ? 'success' : host.accessMode === 'updates' ? 'warn' : 'secondary'" /></div>
       </div>
       <div class="host-access">
         <span><small>{{ t('connectors.host.detail.owner') }}</small><strong>{{ host.ownerName || host.ownerUserId }}</strong></span>
@@ -137,7 +168,10 @@ onMounted(load)
       </div>
       <Message severity="info" :closable="false">{{ t('connectors.host.detail.accessExplanation') }}</Message>
       <Message v-if="stale" severity="warn" :closable="false">{{ t('connectors.host.detail.staleWarning') }}</Message>
-       <div class="toolbar"><Button :label="t('connectors.host.detail.shell')" icon="pi pi-terminal" outlined :disabled="!canFull" @click="shellOpen = true" /></div>
+       <div class="toolbar">
+         <Button :label="t('connectors.host.detail.shell')" icon="pi pi-terminal" outlined :disabled="!canFull" @click="shellOpen = true" />
+         <Button v-if="canManage" :label="t('connectors.host.detail.delete')" icon="pi pi-trash" severity="danger" outlined :disabled="!canDelete || saving" :title="!stale ? t('connectors.host.detail.deleteOnline') : undefined" @click="confirmDeleteHost" />
+       </div>
       <Card>
         <template #title>{{ t('connectors.host.detail.hostedConnectors') }}</template>
         <template #content>
@@ -145,8 +179,8 @@ onMounted(load)
             <template #empty><div class="empty">{{ t('connectors.host.detail.noConnectors') }}</div></template>
             <Column field="displayName" :header="t('connectors.host.detail.connector')" />
             <Column field="artifactVersion" :header="t('connectors.host.detail.version')" />
-            <Column :header="t('connectors.host.detail.readiness')"><template #body="{ data }"><Tag :value="connectorReadiness(data.readiness, t).label" :severity="connectorReadiness(data.readiness, t).severity" /></template></Column>
-             <Column header=""><template #body="{ data }"><div class="row-actions"><Button :label="t('connectors.host.detail.rollback')" size="small" text :disabled="!canUpdate" @click="rollback(data)" /><Button :label="t('connectors.host.detail.remove')" size="small" severity="danger" text :disabled="!canFull" @click="remove(data)" /></div></template></Column>
+            <Column :header="t('connectors.host.detail.readiness')"><template #body="{ data }"><div class="readiness"><Tag :value="connectorReadiness(data.readiness, t).label" :severity="connectorReadiness(data.readiness, t).severity" /><small v-if="data.readinessMessage">{{ data.readinessMessage }}</small></div></template></Column>
+              <Column header=""><template #body="{ data }"><div class="row-actions"><Button :label="t('connectors.host.detail.rollback')" size="small" text :disabled="!canUpdate" @click="rollback(data)" /><Button :label="t('connectors.host.detail.remove')" size="small" severity="danger" text :disabled="!canRemove" @click="remove(data)" /></div></template></Column>
           </DataTable>
         </template>
       </Card>
@@ -184,5 +218,6 @@ onMounted(load)
 h1 { margin: 0 0 .25rem; } p { margin: 0; color: var(--p-text-muted-color); }
 .empty { padding: 1.5rem; text-align: center; color: var(--p-text-muted-color); }
 .form { display: grid; gap: 1rem; }.form label { display: grid; gap: .4rem; font-weight: 600; }.form small { color: var(--p-text-muted-color); }
+.readiness { display: grid; justify-items: start; gap: .35rem; }.readiness small { color: var(--p-red-500); max-width: 28rem; overflow-wrap: anywhere; }
 @media (max-width: 640px) { .heading { align-items: start; } .toolbar { justify-content: stretch; } .toolbar > * { flex: 1; } }
 </style>

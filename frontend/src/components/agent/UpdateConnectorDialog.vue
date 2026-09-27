@@ -32,6 +32,9 @@ const toast = useToast()
 const now = useNow()
 const { t } = useAirlockI18n()
 
+const hostedChildProtocolMajor = 1
+const hostedChildFeature = 'hosted-child-v1'
+
 const hosts = ref<HostInfo[]>([])
 const catalog = ref<ConnectorArtifactCatalog | null>(null)
 const selectedArtifactSetId = ref('')
@@ -53,13 +56,25 @@ const compatibleVersions = computed(() => {
     && version.interface.contractId === need.connectorContractId
   return versions.filter((version) =>
     sameInterface(version)
+    && version.protocolMajor === hostedChildProtocolMajor
+    && version.features.includes(hostedChildFeature)
     && version.targets.some((item) => item.target === target),
   )
 })
-const versionOptions = computed(() => compatibleVersions.value.map((version) => ({
-  value: version.artifactSetId,
-  label: `${version.version} · ${version.sourceCommit || version.buildId}`,
-})))
+const versionOptions = computed(() => compatibleVersions.value.map((version) => {
+  const target = host.value && version.targets.find((item) => item.target === `${host.value?.platform}-${host.value?.architecture}`)
+  const label = t('connectors.update.artifactOption', {
+    version: version.version,
+    build: version.buildId.slice(0, 8),
+    digest: (target?.sha256 || version.artifactDigest).slice(0, 12),
+  })
+  return {
+    value: version.artifactSetId,
+    label: target?.sha256 === props.connector?.artifactDigest
+      ? `${label} · ${t('connectors.update.currentArtifact')}`
+      : label,
+  }
+}))
 const selectedVersion = computed(() => compatibleVersions.value.find((version) => version.artifactSetId === selectedArtifactSetId.value))
 const selectedTarget = computed<ConnectorArtifactTarget | undefined>(() => {
   const selectedHost = host.value
@@ -73,7 +88,7 @@ const blocker = computed(() => {
   if (!props.agentAdmin) return t('connectors.update.agentAdminRequired')
   if (!host.value) return t('connectors.update.hostUnavailable')
   if (!hasCapability(host.value.capabilities, 'manage')) return t('connectors.update.manageRequired')
-  if (host.value.accessMode !== 'full' && host.value.accessMode !== 'update_only') return t('connectors.update.disabled')
+  if (host.value.accessMode !== 'full' && host.value.accessMode !== 'manage' && host.value.accessMode !== 'updates') return t('connectors.update.disabled')
   if (isHostStale(host.value.lastSeenAt, now.value)) return t('connectors.install.host.stale')
   if (!compatibleVersions.value.length) return t('connectors.update.noArtifact', { platform: `${host.value.platform}-${host.value.architecture}` })
   if (selectedVersion.value?.settings.some((setting) => !setting.jsonName)) return t('connectors.install.host.rebuildForSettings')
@@ -156,7 +171,8 @@ function settingError(setting: ConnectorSettingDescriptor): string {
 
 function accessModeLabel(mode: string): string {
   if (mode === 'full') return t('connectors.host.access.full')
-  if (mode === 'update_only') return t('connectors.host.access.updateOnly')
+  if (mode === 'manage') return t('connectors.host.access.manage')
+  if (mode === 'updates') return t('connectors.host.access.updates')
   if (mode === 'none') return t('connectors.host.access.none')
   return mode
 }

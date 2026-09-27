@@ -22,6 +22,7 @@ import (
 	"github.com/airlockrun/airlock/authz"
 	"github.com/airlockrun/airlock/db"
 	"github.com/airlockrun/airlock/db/dbq"
+	"github.com/airlockrun/airlock/db/notifications"
 	"github.com/airlockrun/airlock/secrets"
 	"github.com/airlockrun/airlock/service"
 	connectorjobssvc "github.com/airlockrun/airlock/service/connectorjobs"
@@ -57,6 +58,7 @@ type Service struct {
 	connectorJobs  *connectorjobssvc.Service
 	secrets        secrets.Store
 	logger         *zap.Logger
+	notifications  *notifications.Relay
 }
 
 type Enrollment struct {
@@ -131,14 +133,15 @@ type observedInventorySlot struct {
 	candidate     *dbq.ListObservedArtifactCandidatesRow
 }
 
-func New(database *db.DB, publicURL string, storageOrigins []string, store objectStore, connectorJobs *connectorjobssvc.Service, secretStore secrets.Store, logger *zap.Logger) *Service {
-	if database == nil || store == nil || connectorJobs == nil || secretStore == nil || logger == nil {
+func New(database *db.DB, publicURL string, storageOrigins []string, store objectStore, connectorJobs *connectorjobssvc.Service, secretStore secrets.Store, relay *notifications.Relay, logger *zap.Logger) *Service {
+	if database == nil || store == nil || connectorJobs == nil || secretStore == nil || relay == nil || logger == nil {
 		panic("hosts: nil dependency")
 	}
 	return &Service{
 		db: database, publicURL: strings.TrimRight(publicURL, "/"),
 		storageOrigins: slices.Clone(storageOrigins), store: store,
 		connectorJobs: connectorJobs, secrets: secretStore, logger: logger,
+		notifications: relay,
 	}
 }
 
@@ -159,7 +162,7 @@ func validateInfo(info protocol.HostInfo) error {
 	if info.Architecture != "amd64" && info.Architecture != "arm64" && !(info.Platform == "linux" && info.Architecture == "armv7") {
 		return service.Detail(service.ErrInvalidInput, "invalid host architecture")
 	}
-	if info.AccessMode != protocol.RemoteAccessFull && info.AccessMode != protocol.RemoteAccessUpdateOnly && info.AccessMode != protocol.RemoteAccessNone {
+	if info.AccessMode != protocol.RemoteAccessFull && info.AccessMode != protocol.RemoteAccessManage && info.AccessMode != protocol.RemoteAccessUpdates && info.AccessMode != protocol.RemoteAccessNone {
 		return service.Detail(service.ErrInvalidInput, "invalid host access mode")
 	}
 	return nil
@@ -517,12 +520,19 @@ func (s *Service) ReconcileInventory(ctx context.Context, hostID uuid.UUID, requ
 	if err != nil {
 		return protocol.HostConnectorInventoryMutationResponse{}, err
 	}
+	contractID := request.Active.Manifest.Interface.ContractID
+	if exists && current.ContractID.String != contractID {
+		return protocol.HostConnectorInventoryMutationResponse{}, service.Detail(service.ErrConflict, "an installation's contract ID cannot change; remove the installation before installing another contract")
+	}
+	if err := admitHostContract(ctx, q, hostID, connectorID, contractID); err != nil {
+		return protocol.HostConnectorInventoryMutationResponse{}, err
+	}
 	if exists && current.ArtifactDigest.Valid && current.ArtifactDigest.String != active.digest {
 		transition, err := q.HasActiveConnectorManagementTransition(ctx, pg(connectorID))
 		if err != nil {
 			return protocol.HostConnectorInventoryMutationResponse{}, err
 		}
-		if transition {
+		if transition && request.ManagementAttempt == nil {
 			return protocol.HostConnectorInventoryMutationResponse{}, service.Detail(service.ErrConflict, "connector inventory transition is awaiting fenced management completion")
 		}
 	}
@@ -535,6 +545,39 @@ func (s *Service) ReconcileInventory(ctx context.Context, hostID uuid.UUID, requ
 		rollback, err = classifyObservedInventorySlot(ctx, q, host, *request.Rollback, rollbackLineage)
 		if err != nil {
 			return protocol.HostConnectorInventoryMutationResponse{}, err
+		}
+	}
+	if request.ManagementAttempt != nil {
+		jobID, _ := uuid.Parse(request.ManagementAttempt.JobID)
+		token, _ := uuid.Parse(request.ManagementAttempt.AttemptToken)
+		job, err := q.GetCompletedHostManagementJobForAttempt(ctx, dbq.GetCompletedHostManagementJobForAttemptParams{JobID: pg(jobID), HostID: pg(hostID), AttemptToken: pg(token)})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return protocol.HostConnectorInventoryMutationResponse{}, service.Detail(service.ErrConflict, "inventory requires its latest completed management attempt")
+		}
+		if err != nil {
+			return protocol.HostConnectorInventoryMutationResponse{}, err
+		}
+		if !exists || job.ConnectorID != pg(connectorID) || job.Status != "succeeded" || !job.InventoryRevision.Valid || job.InventoryRevision.Int64 != revision || active.state != "known" || rollback.state != "known" {
+			return protocol.HostConnectorInventoryMutationResponse{}, service.Detail(service.ErrConflict, "inventory does not match its completed management transition")
+		}
+		if rollback.artifactSetID != current.ArtifactSetID || rollback.digest != current.ArtifactDigest.String {
+			return protocol.HostConnectorInventoryMutationResponse{}, service.Detail(service.ErrConflict, "management inventory must retain the authorized active artifact as rollback")
+		}
+		switch job.Kind {
+		case "connector_update":
+			artifact, err := q.GetHostArtifactFile(ctx, job.ArtifactFileID)
+			if err != nil {
+				return protocol.HostConnectorInventoryMutationResponse{}, err
+			}
+			if artifact.ArtifactSetID != active.artifactSetID || artifact.Digest != active.digest {
+				return protocol.HostConnectorInventoryMutationResponse{}, service.Detail(service.ErrConflict, "inventory does not match the management update artifact")
+			}
+		case "connector_rollback":
+			if active.artifactSetID != current.RollbackArtifactSetID || active.digest != current.ObservedRollbackDigest.String {
+				return protocol.HostConnectorInventoryMutationResponse{}, service.Detail(service.ErrConflict, "inventory does not match the authorized rollback slot")
+			}
+		default:
+			return protocol.HostConnectorInventoryMutationResponse{}, service.Detail(service.ErrConflict, "management work does not authorize an inventory transition")
 		}
 	}
 	interfaceRaw, err := canonicalJSON(request.Active.Manifest.Interface)
@@ -613,6 +656,9 @@ func (s *Service) ReconcileInventory(ctx context.Context, hostID uuid.UUID, requ
 		if err := q.UnbindConnectorInventory(ctx, pg(connectorID)); err != nil {
 			return protocol.HostConnectorInventoryMutationResponse{}, err
 		}
+	}
+	if err := q.AcknowledgeHostManagementInventory(ctx, dbq.AcknowledgeHostManagementInventoryParams{HostID: pg(hostID), ConnectorID: pg(connectorID), InventoryRevision: pgtype.Int8{Int64: revision, Valid: true}}); err != nil {
+		return protocol.HostConnectorInventoryMutationResponse{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return protocol.HostConnectorInventoryMutationResponse{}, err
@@ -704,6 +750,22 @@ func textValue(value string) pgtype.Text {
 	return pgtype.Text{String: value, Valid: true}
 }
 
+func admitHostContract(ctx context.Context, q *dbq.Queries, hostID, excludingID uuid.UUID, contractID string) error {
+	if contractID == "" {
+		return nil
+	}
+	id, err := q.GetHostContractInstallation(ctx, dbq.GetHostContractInstallationParams{
+		HostID: pg(hostID), ContractID: textValue(contractID), ExcludingID: pg(excludingID),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return service.Detail(service.ErrConflict, "contract %q already has installation %s on this host; use or update that installation, or remove it on the host before installing again", contractID, uuid.UUID(id.Bytes))
+}
+
 func nullableText(value string) pgtype.Text {
 	return pgtype.Text{String: value, Valid: value != ""}
 }
@@ -761,6 +823,42 @@ func (s *Service) Get(ctx context.Context, p authz.Principal, hostID uuid.UUID) 
 	return Detail{Host: host, Capabilities: capabilities, OwnerName: names[0].Name, Connectors: connectors, Jobs: jobs}, err
 }
 
+func (s *Service) Delete(ctx context.Context, p authz.Principal, hostID uuid.UUID) error {
+	tx, err := s.db.Pool().Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	q := dbq.New(tx)
+	if err := authz.AuthorizeResource(ctx, q, p, authz.ResourceManage, "host", hostID); err != nil {
+		return err
+	}
+	if err := authz.LockResource(ctx, q, "host", hostID); err != nil {
+		return err
+	}
+	if err := authz.AuthorizeResource(ctx, q, p, authz.ResourceManage, "host", hostID); err != nil {
+		return err
+	}
+	host, err := q.GetHost(ctx, pg(hostID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return service.ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if hostHeartbeatFresh(host.LastSeenAt, time.Now()) {
+		return service.Detail(service.ErrConflict, "host is still online; unenroll or stop it and wait for its heartbeat to become stale before deleting it")
+	}
+	deleted, err := q.DeleteHost(ctx, pg(hostID))
+	if err != nil {
+		return err
+	}
+	if deleted != 1 {
+		return service.ErrNotFound
+	}
+	return tx.Commit(ctx)
+}
+
 func (s *Service) GetJob(ctx context.Context, p authz.Principal, jobID uuid.UUID) (dbq.HostManagementJob, []dbq.HostManagementEvent, error) {
 	q := dbq.New(s.db.Pool())
 	job, err := q.GetHostManagementJob(ctx, pg(jobID))
@@ -802,8 +900,16 @@ func timeout(value time.Duration) (time.Duration, error) {
 }
 
 func requireMode(host dbq.Host, kind string) error {
-	if host.AccessMode == "full" || host.AccessMode == "update_only" && (kind == "connector_update" || kind == "connector_rollback") {
-		return nil
+	switch kind {
+	case "shell":
+		if host.AccessMode == string(protocol.RemoteAccessFull) {
+			return nil
+		}
+	case "connector_install", "connector_update", "connector_rollback", "connector_remove":
+		if host.AccessMode == string(protocol.RemoteAccessFull) || host.AccessMode == string(protocol.RemoteAccessManage) ||
+			host.AccessMode == string(protocol.RemoteAccessUpdates) && (kind == "connector_update" || kind == "connector_rollback") {
+			return nil
+		}
 	}
 	return service.Detail(service.ErrConflict, "host reported %s local access; requested management is not allowed", host.AccessMode)
 }
@@ -867,6 +973,12 @@ func (s *Service) RequestInstall(ctx context.Context, p authz.Principal, hostID 
 			return dbq.HostManagementJob{}, service.Detail(service.ErrNotFound, "artifact file is not retained for this host and agent")
 		}
 		if err != nil {
+			return dbq.HostManagementJob{}, err
+		}
+		if artifact.ProtocolMajor != int32(protocol.Major) || !slices.Contains(artifact.Features, protocol.FeatureHostedChildV1) {
+			return dbq.HostManagementJob{}, service.Detail(service.ErrNotFound, "artifact file is not compatible with this connector host")
+		}
+		if err := admitHostContract(ctx, qtx, hostID, uuid.Nil, artifact.ContractID); err != nil {
 			return dbq.HostManagementJob{}, err
 		}
 		count, err := qtx.CountHostedConnectorsForHost(ctx, pg(hostID))
@@ -1149,8 +1261,21 @@ func renewConnectorAttempts(ctx context.Context, q *dbq.Queries, hostID uuid.UUI
 	return nil
 }
 
-func (s *Service) ClaimWork(ctx context.Context, hostID uuid.UUID, claimConnector bool) (*protocol.HostWork, error) {
-	q := dbq.New(s.db.Pool())
+func (s *Service) ClaimWork(ctx context.Context, hostID uuid.UUID, claimConnector bool) (work *protocol.HostWork, err error) {
+	tx, err := s.db.Pool().Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	defer func() {
+		if err == nil {
+			err = tx.Commit(ctx)
+		}
+	}()
+	q := dbq.New(tx)
+	if err := q.LockHostDispatch(ctx, pg(hostID)); err != nil {
+		return nil, err
+	}
 	if _, err := q.FailExpiredHostManagementJobs(ctx, 100); err != nil {
 		return nil, err
 	}
@@ -1200,6 +1325,13 @@ func (s *Service) ClaimWork(ctx context.Context, hostID uuid.UUID, claimConnecto
 	if !claimConnector {
 		return nil, nil
 	}
+	count, err := q.CountHostConnectorAttempts(ctx, pg(hostID))
+	if err != nil {
+		return nil, err
+	}
+	if count >= protocol.MaxHostConnectorClaims {
+		return nil, nil
+	}
 	if _, err := q.FailExpiredConnectorJobs(ctx, 100); err != nil {
 		return nil, err
 	}
@@ -1225,42 +1357,10 @@ func (s *Service) ClaimWork(ctx context.Context, hostID uuid.UUID, claimConnecto
 	}, nil
 }
 
-func (s *Service) WaitForWork(ctx context.Context, hostID uuid.UUID, claimConnector bool, maximum time.Duration) (*protocol.HostWork, error) {
-	if maximum <= 0 || maximum > 30*time.Second {
-		maximum = 25 * time.Second
-	}
-	if work, err := s.ClaimWork(ctx, hostID, claimConnector); err != nil || work != nil {
-		return work, err
-	}
-	conn, err := s.db.Pool().Acquire(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Release()
-	if _, err := conn.Exec(ctx, "LISTEN airlock_host_work"); err != nil {
-		return nil, err
-	}
-	if _, err := conn.Exec(ctx, "LISTEN airlock_connector_dispatch"); err != nil {
-		return nil, err
-	}
-	defer conn.Exec(context.Background(), "UNLISTEN *")
-	if work, err := s.ClaimWork(ctx, hostID, claimConnector); err != nil || work != nil {
-		return work, err
-	}
-	waitCtx, cancel := context.WithTimeout(ctx, maximum)
-	defer cancel()
-	for {
-		_, err := conn.Conn().WaitForNotification(waitCtx)
-		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-			return nil, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-		if work, err := s.ClaimWork(ctx, hostID, claimConnector); err != nil || work != nil {
-			return work, err
-		}
-	}
+// SubscribeWork subscribes to host management and connector dispatch/cancellation
+// hints. Subscribe before reading durable state, and Close when finished.
+func (s *Service) SubscribeWork(hostID uuid.UUID) *notifications.Subscription {
+	return s.notifications.Subscribe(notifications.HostWork, hostID)
 }
 
 func (s *Service) AppendManagementEvent(ctx context.Context, hostID, jobID uuid.UUID, event protocol.HostManagementEvent) (dbq.AppendHostManagementEventRow, error) {
@@ -1283,6 +1383,9 @@ func (s *Service) AppendManagementEvent(ctx context.Context, hostID, jobID uuid.
 }
 
 func (s *Service) CompleteManagement(ctx context.Context, hostID, jobID uuid.UUID, completion protocol.HostManagementCompletion) (dbq.HostManagementJob, error) {
+	if completion.InventoryRevision > math.MaxInt64 {
+		return dbq.HostManagementJob{}, service.ErrInvalidInput
+	}
 	if completion.JobID != "" && completion.JobID != jobID.String() {
 		return dbq.HostManagementJob{}, service.Detail(service.ErrInvalidInput, "management completion job ID does not match request path")
 	}
@@ -1300,7 +1403,7 @@ func (s *Service) CompleteManagement(ctx context.Context, hostID, jobID uuid.UUI
 	}
 	completionStatus := map[string]string{"success": "succeeded", "error": "failed", "canceled": "cancelled", "timeout": "timed_out"}[completion.Status]
 	query := dbq.New(s.db.Pool())
-	if existing, replay, err := s.completedManagementReplay(ctx, query, hostID, jobID, token, completionStatus, output, completion.Error); err != nil || replay {
+	if existing, replay, err := s.completedManagementReplay(ctx, query, hostID, jobID, token, completionStatus, output, completion.Error, completion.InventoryRevision); err != nil || replay {
 		return existing, err
 	}
 	secretOutput := ""
@@ -1321,13 +1424,24 @@ func (s *Service) CompleteManagement(ctx context.Context, hostID, jobID uuid.UUI
 		ErrorMessage: completion.Error, SecretOutput: secretOutput, CompletionStatus: completionStatus,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		if existing, replay, replayErr := s.completedManagementReplay(ctx, query, hostID, jobID, token, completionStatus, output, completion.Error); replayErr != nil || replay {
+		if existing, replay, replayErr := s.completedManagementReplay(ctx, query, hostID, jobID, token, completionStatus, output, completion.Error, completion.InventoryRevision); replayErr != nil || replay {
 			return existing, replayErr
 		}
 		return dbq.HostManagementJob{}, service.Detail(service.ErrConflict, "host management lease is stale")
 	}
 	if err != nil {
 		return dbq.HostManagementJob{}, err
+	}
+	transition := succeeded && (row.Kind == "connector_update" || row.Kind == "connector_rollback")
+	if transition != (completion.InventoryRevision != 0) {
+		return dbq.HostManagementJob{}, service.Detail(service.ErrInvalidInput, "successful update or rollback requires its durable inventory revision")
+	}
+	if transition {
+		updated, err := q.RecordHostManagementInventoryRevision(ctx, dbq.RecordHostManagementInventoryRevisionParams{ID: row.ID, InventoryRevision: pgtype.Int8{Int64: int64(completion.InventoryRevision), Valid: true}})
+		if err != nil {
+			return dbq.HostManagementJob{}, err
+		}
+		row = dbq.CompleteHostManagementJobRow(updated)
 	}
 	if succeeded && row.Kind == "connector_remove" {
 		if affected, err := q.FinalizeConnectorRemoval(ctx, row.ConnectorID); err != nil || affected != 1 {
@@ -1343,7 +1457,7 @@ func (s *Service) CompleteManagement(ctx context.Context, hostID, jobID uuid.UUI
 	return dbq.HostManagementJob(row), nil
 }
 
-func (s *Service) completedManagementReplay(ctx context.Context, q *dbq.Queries, hostID, jobID, token uuid.UUID, status string, output json.RawMessage, completionError string) (dbq.HostManagementJob, bool, error) {
+func (s *Service) completedManagementReplay(ctx context.Context, q *dbq.Queries, hostID, jobID, token uuid.UUID, status string, output json.RawMessage, completionError string, inventoryRevision uint64) (dbq.HostManagementJob, bool, error) {
 	job, err := q.GetCompletedHostManagementJobForAttempt(ctx, dbq.GetCompletedHostManagementJobForAttemptParams{JobID: pg(jobID), HostID: pg(hostID), AttemptToken: pg(token)})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return dbq.HostManagementJob{}, false, nil
@@ -1359,6 +1473,9 @@ func (s *Service) completedManagementReplay(ctx context.Context, q *dbq.Queries,
 	}
 	if job.ErrorMessage.String != completionError {
 		return dbq.HostManagementJob{}, false, service.Detail(service.ErrConflict, "host management completion conflicts with its recorded outcome")
+	}
+	if job.InventoryRevision.Valid != (inventoryRevision != 0) || job.InventoryRevision.Int64 != int64(inventoryRevision) {
+		return dbq.HostManagementJob{}, false, service.Detail(service.ErrConflict, "host management completion conflicts with its inventory revision")
 	}
 	if status == "succeeded" {
 		plaintext, err := s.secrets.Get(ctx, managementSecretRef(jobID, "output"), job.SecretOutput.String)

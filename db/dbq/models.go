@@ -125,6 +125,8 @@ type AgentConversation struct {
 	ContextCheckpointMessageID pgtype.UUID        `json:"context_checkpoint_message_id"`
 	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
+	UserActivityAt             pgtype.Timestamptz `json:"user_activity_at"`
+	NotificationRouteLostAt    pgtype.Timestamptz `json:"notification_route_lost_at"`
 }
 
 type AgentDirectory struct {
@@ -454,6 +456,7 @@ type AgentTopic struct {
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 	PerUser     bool               `json:"per_user"`
+	Enrollment  string             `json:"enrollment"`
 }
 
 type AgentUserModelPreference struct {
@@ -642,17 +645,18 @@ type ConnectorJob struct {
 }
 
 type ConnectorJobAttempt struct {
-	JobID          pgtype.UUID        `json:"job_id"`
-	AttemptNumber  int32              `json:"attempt_number"`
-	AttemptToken   pgtype.UUID        `json:"attempt_token"`
-	Status         string             `json:"status"`
-	LeaseExpiresAt pgtype.Timestamptz `json:"lease_expires_at"`
-	LeasedAt       pgtype.Timestamptz `json:"leased_at"`
-	StartedAt      pgtype.Timestamptz `json:"started_at"`
-	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
-	ErrorMessage   pgtype.Text        `json:"error_message"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+	JobID             pgtype.UUID        `json:"job_id"`
+	AttemptNumber     int32              `json:"attempt_number"`
+	AttemptToken      pgtype.UUID        `json:"attempt_token"`
+	Status            string             `json:"status"`
+	LeaseExpiresAt    pgtype.Timestamptz `json:"lease_expires_at"`
+	LeasedAt          pgtype.Timestamptz `json:"leased_at"`
+	StartedAt         pgtype.Timestamptz `json:"started_at"`
+	CompletedAt       pgtype.Timestamptz `json:"completed_at"`
+	ErrorMessage      pgtype.Text        `json:"error_message"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	CompletionReceipt []byte             `json:"completion_receipt"`
 }
 
 type ConnectorJobEvent struct {
@@ -959,23 +963,25 @@ type HostManagementEvent struct {
 }
 
 type HostManagementJob struct {
-	ID                pgtype.UUID        `json:"id"`
-	HostID            pgtype.UUID        `json:"host_id"`
-	ConnectorID       pgtype.UUID        `json:"connector_id"`
-	RequestedByUserID pgtype.UUID        `json:"requested_by_user_id"`
-	Kind              string             `json:"kind"`
-	ArtifactFileID    pgtype.UUID        `json:"artifact_file_id"`
-	InputPayload      []byte             `json:"input_payload"`
-	SecretInput       string             `json:"secret_input"`
-	Status            string             `json:"status"`
-	OutputPayload     []byte             `json:"output_payload"`
-	SecretOutput      pgtype.Text        `json:"secret_output"`
-	ErrorMessage      pgtype.Text        `json:"error_message"`
-	DeadlineAt        pgtype.Timestamptz `json:"deadline_at"`
-	StartedAt         pgtype.Timestamptz `json:"started_at"`
-	CompletedAt       pgtype.Timestamptz `json:"completed_at"`
-	CreatedAt         pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	ID                      pgtype.UUID        `json:"id"`
+	HostID                  pgtype.UUID        `json:"host_id"`
+	ConnectorID             pgtype.UUID        `json:"connector_id"`
+	RequestedByUserID       pgtype.UUID        `json:"requested_by_user_id"`
+	Kind                    string             `json:"kind"`
+	ArtifactFileID          pgtype.UUID        `json:"artifact_file_id"`
+	InputPayload            []byte             `json:"input_payload"`
+	SecretInput             string             `json:"secret_input"`
+	Status                  string             `json:"status"`
+	OutputPayload           []byte             `json:"output_payload"`
+	SecretOutput            pgtype.Text        `json:"secret_output"`
+	ErrorMessage            pgtype.Text        `json:"error_message"`
+	DeadlineAt              pgtype.Timestamptz `json:"deadline_at"`
+	StartedAt               pgtype.Timestamptz `json:"started_at"`
+	CompletedAt             pgtype.Timestamptz `json:"completed_at"`
+	CreatedAt               pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt               pgtype.Timestamptz `json:"updated_at"`
+	InventoryRevision       pgtype.Int8        `json:"inventory_revision"`
+	InventoryAcknowledgedAt pgtype.Timestamptz `json:"inventory_acknowledged_at"`
 }
 
 type IdentityLinkChallenge struct {
@@ -1032,16 +1038,6 @@ type ManagedBotSession struct {
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
 	SystemConversationID pgtype.UUID        `json:"system_conversation_id"`
 	ChatOriginID         pgtype.UUID        `json:"chat_origin_id"`
-}
-
-type McpActiveRequest struct {
-	TargetAgentID     pgtype.UUID        `json:"target_agent_id"`
-	PrincipalIdentity string             `json:"principal_identity"`
-	RequestID         []byte             `json:"request_id"`
-	RunID             pgtype.UUID        `json:"run_id"`
-	ExpiresAt         pgtype.Timestamptz `json:"expires_at"`
-	CreatedAt         pgtype.Timestamptz `json:"created_at"`
-	OwnerToken        pgtype.UUID        `json:"owner_token"`
 }
 
 type Migration004ResourceGrantBackup struct {
@@ -1373,6 +1369,8 @@ type SystemSetting struct {
 	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
 	LastSeenSdkVersion         string             `json:"last_seen_sdk_version"`
 	UiLocale                   string             `json:"ui_locale"`
+	CodegenMaxSteps            int32              `json:"codegen_max_steps"`
+	CodegenMaxInputTokens      int32              `json:"codegen_max_input_tokens"`
 }
 
 type Tenant struct {
@@ -1384,11 +1382,19 @@ type Tenant struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
+type TopicPreference struct {
+	TopicID pgtype.UUID `json:"topic_id"`
+	UserID  pgtype.UUID `json:"user_id"`
+	Enabled bool        `json:"enabled"`
+}
+
 type TopicSubscription struct {
 	ID             pgtype.UUID        `json:"id"`
 	TopicID        pgtype.UUID        `json:"topic_id"`
 	ConversationID pgtype.UUID        `json:"conversation_id"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UserID         pgtype.UUID        `json:"user_id"`
+	Automatic      bool               `json:"automatic"`
 }
 
 type User struct {

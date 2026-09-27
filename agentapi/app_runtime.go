@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 
 	"github.com/airlockrun/agentsdk/wire"
 	"github.com/airlockrun/airlock/apperr"
@@ -47,6 +49,39 @@ func readAppJSON(r *http.Request, v any) error {
 		return apperr.ErrInvalidInput
 	}
 	return nil
+}
+
+func (h *Handler) ListMembers(w http.ResponseWriter, r *http.Request) {
+	values, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid query")
+		return
+	}
+	opts := appruntime.ListMembersOptions{}
+	if limits, ok := values["limit"]; ok {
+		if len(limits) != 1 || limits[0] == "" {
+			writeJSONError(w, http.StatusBadRequest, "invalid limit")
+			return
+		}
+		opts.Limit, err = strconv.Atoi(limits[0])
+		if err != nil || opts.Limit < 0 || opts.Limit > 1000 {
+			writeJSONError(w, http.StatusBadRequest, "invalid limit")
+			return
+		}
+	}
+	if cursors, ok := values["cursor"]; ok {
+		if len(cursors) != 1 || cursors[0] == "" {
+			writeJSONError(w, http.StatusBadRequest, "invalid cursor")
+			return
+		}
+		opts.Cursor = cursors[0]
+	}
+	result, err := h.appService().ListMembers(r.Context(), opts)
+	if err != nil {
+		h.appError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (h *Handler) Sync(w http.ResponseWriter, r *http.Request) {
