@@ -1,0 +1,11 @@
+module airlock-imported-app
+
+go @GO_VERSION@
+
+require (
+    github.com/airlockrun/agentsdk v@AGENTSDK_VERSION@
+    github.com/airlockrun/goai v@GOAI_VERSION@
+)
+
+tool github.com/airlockrun/agentsdk/cmd/air
+tool github.com/a-h/templ/cmd/templ

@@ -4,12 +4,13 @@
   <img src="docs/airlock-demo.gif" alt="Airlock demo" width="800">
 </p>
 
-Airlock is a self-hosted platform for creating and deploying AI-native apps. Build an app in Go or prompt one into existence, then run it with web UI, AI chat, APIs, authentication, storage, integrations, logs, and its own subdomain on infrastructure you control.
+Airlock is a self-hosted platform for creating and deploying AI-native apps. Build an app in Go, import an existing Python or TypeScript HTTP app, or prompt one into existence, then run it with web UI, AI chat, APIs, authentication, storage, integrations, logs, and its own subdomain on infrastructure you control.
 
 - [Website](https://airlock.run)
 - [Documentation](https://airlock.run/docs/)
 - [Installation guide](https://airlock.run/docs/installation/)
 - [Agent SDK and CLI](https://airlock.run/docs/agentsdk/)
+- [Import an existing Python or TypeScript app](tools/import-app/README.md)
 - [Releases](https://github.com/airlockrun/airlock/releases)
 
 ## Installation

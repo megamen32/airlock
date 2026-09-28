@@ -1,0 +1,338 @@
+package main
+
+import (
+	"context"
+	_ "embed"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/airlockrun/agentsdk"
+	"github.com/airlockrun/agentsdk/scaffold"
+	"github.com/airlockrun/goai/tool"
+)
+
+//go:embed app.json
+var appJSON []byte
+
+type appConfig struct {
+	Runtime     string   `json:"runtime"`
+	Description string   `json:"description"`
+	Command     []string `json:"command"`
+	Port        int      `json:"port"`
+	HealthPath  string   `json:"healthPath"`
+	Environment []string `json:"environment"`
+	ToolRoutes  []string `json:"toolRoutes"`
+}
+
+type sidecarHost struct {
+	config      appConfig
+	target      *url.URL
+	cmd         *exec.Cmd
+	exited      chan struct{}
+	waitErr     error
+	stop        sync.Once
+	closing     chan struct{}
+	environment map[string]*agentsdk.EnvVarHandle
+}
+
+var exactToolRoute = regexp.MustCompile(`^(GET|POST|PUT|PATCH|DELETE|OPTIONS):/[^?#[:space:]]*$`)
+
+func newApplication() (*agentsdk.Agent, *sidecarHost) {
+	var cfg appConfig
+	if err := json.Unmarshal(appJSON, &cfg); err != nil {
+		panic(err)
+	}
+	return newApplicationWithConfig(cfg)
+}
+
+func newApplicationWithConfig(cfg appConfig) (*agentsdk.Agent, *sidecarHost) {
+	if cfg.Runtime != "python" && cfg.Runtime != "typescript" {
+		panic("unsupported imported application runtime")
+	}
+	if len(cfg.Command) == 0 || strings.TrimSpace(cfg.Command[0]) == "" || cfg.Port < 1024 || cfg.Port > 65535 {
+		panic("invalid imported application launch configuration")
+	}
+	if _, err := parseLocalPath(cfg.HealthPath, false); err != nil {
+		panic("invalid imported application health path")
+	}
+	for _, route := range cfg.ToolRoutes {
+		parts := strings.SplitN(route, ":", 2)
+		if len(route) > 2100 || !exactToolRoute.MatchString(route) || len(parts) != 2 || hasParentSegment(parts[1]) {
+			panic("invalid imported application tool route")
+		}
+	}
+	target, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", cfg.Port))
+	host := &sidecarHost{config: cfg, target: target, exited: make(chan struct{}), closing: make(chan struct{}), environment: map[string]*agentsdk.EnvVarHandle{}}
+	emoji := "🐍"
+	if cfg.Runtime == "typescript" {
+		emoji = "🔷"
+	}
+	app := agentsdk.New(agentsdk.Config{Description: cfg.Description, Emoji: emoji})
+	for _, name := range cfg.Environment {
+		if !regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`).MatchString(name) || strings.HasPrefix(name, "AIRLOCK_") || name == "PATH" || name == "HOME" || name == "PORT" || name == "HOST" || name == "HOSTNAME" {
+			panic("invalid imported application environment variable")
+		}
+		host.environment[name] = app.RegisterEnvVar(&agentsdk.EnvVar{Slug: "app_" + strings.ToLower(name), Description: "Private imported-application configuration: " + name, Secret: true})
+	}
+	app.OnStart("imported-application", host.start)
+	proxy := &httputil.ReverseProxy{Rewrite: func(request *httputil.ProxyRequest) {
+		request.SetURL(host.target)
+		request.Out.Host = request.In.Host
+		request.SetXForwarded()
+		// Airlock credentials and caller-shaped headers never become app credentials.
+		request.Out.Header.Del("Authorization")
+		request.Out.Header.Del("Cookie")
+		for _, cookie := range request.In.Cookies() {
+			if cookie.Name != "__air_session" && cookie.Name != "airlock_session" && cookie.Name != "airlock_refresh" {
+				request.Out.AddCookie(cookie)
+			}
+		}
+		for key := range request.Out.Header {
+			lower := strings.ToLower(key)
+			if strings.HasPrefix(lower, "x-airlock-") || strings.HasPrefix(lower, "x-caller-") || strings.EqualFold(key, "X-User-ID") {
+				request.Out.Header.Del(key)
+			}
+		}
+		caller := agentsdk.CallerFromContext(request.In.Context())
+		if user, ok := caller.User(); ok {
+			request.Out.Header.Set("X-Airlock-User-ID", user.ID)
+		}
+		request.Out.Header.Set("X-Airlock-Access", string(caller.Access()))
+	}, ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
+		http.Error(w, "Imported application is unavailable", http.StatusBadGateway)
+	}}
+	for _, method := range []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"} {
+		app.RegisterRoute(&agentsdk.Route{Method: method, Path: "/{path...}", Access: agentsdk.AccessUser,
+			Description: "Imported " + cfg.Runtime + " application", Handler: func(w http.ResponseWriter, request *http.Request) error {
+				proxy.ServeHTTP(w, request)
+				return nil
+			}})
+	}
+	if len(cfg.ToolRoutes) > 0 {
+		app.RegisterTool(tool.Typed[requestInput, requestOutput]("app_request").
+			Description("Call only an exact imported-application endpoint approved by the operator: "+strings.Join(cfg.ToolRoutes, ", ")+". Never retry an uncertain result automatically.").
+			Execute(host.request).Build(), agentsdk.AccessUser)
+		app.AddInstruction(&agentsdk.Instruction{Access: []agentsdk.Access{agentsdk.AccessUser}, Text: "The imported application exposes only the exact app_request routes selected by its operator. Never infer another endpoint, change the target host, or retry an uncertain operation. Side effects still require the application's own approval policy."})
+	}
+	return app, host
+}
+
+func (h *sidecarHost) start(ctx context.Context) error {
+	root := os.Getenv("AIRLOCK_IMPORTED_APP_ROOT")
+	if root == "" {
+		root = "/opt/airlock-app/app"
+	}
+	if _, err := os.Stat(root); err != nil {
+		return fmt.Errorf("imported source directory unavailable: %w", err)
+	}
+	args := append([]string(nil), h.config.Command...)
+	for index := range args {
+		args[index] = strings.ReplaceAll(args[index], "{port}", fmt.Sprint(h.config.Port))
+	}
+	executable := args[0]
+	if h.config.Runtime == "python" && !strings.Contains(executable, "/") {
+		candidate := filepath.Join("/opt/airlock-app/venv/bin", executable)
+		if _, err := os.Stat(candidate); err == nil {
+			executable = candidate
+		}
+	}
+	h.cmd = exec.Command(executable, args[1:]...)
+	h.cmd.Dir = root
+	h.cmd.Env = []string{
+		"PATH=/opt/airlock-app/venv/bin:/usr/local/bin:/usr/bin:/bin",
+		"LANG=C.UTF-8",
+		"PORT=" + fmt.Sprint(h.config.Port),
+		"HOST=127.0.0.1",
+		"HOSTNAME=127.0.0.1",
+		"PYTHONUNBUFFERED=1",
+		"PYTHONDONTWRITEBYTECODE=1",
+	}
+	for name, handle := range h.environment {
+		value, err := handle.Get(ctx)
+		if err != nil {
+			return fmt.Errorf("missing imported application configuration %s", name)
+		}
+		h.cmd.Env = append(h.cmd.Env, name+"="+value)
+	}
+	h.cmd.Stdout = os.Stdout
+	h.cmd.Stderr = os.Stderr
+	h.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := h.cmd.Start(); err != nil {
+		return fmt.Errorf("start imported application: %w", err)
+	}
+	go func() {
+		h.waitErr = h.cmd.Wait()
+		close(h.exited)
+	}()
+	ready, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	client := &http.Client{Timeout: time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		request, _ := http.NewRequestWithContext(ready, http.MethodGet, h.target.String()+h.config.HealthPath, nil)
+		response, err := client.Do(request)
+		if err == nil {
+			response.Body.Close()
+			if response.StatusCode < 500 {
+				return nil
+			}
+		}
+		select {
+		case <-h.exited:
+			return errors.New("imported application exited before becoming ready")
+		case <-ready.Done():
+			h.close()
+			return errors.New("imported application readiness timed out")
+		case <-ticker.C:
+		}
+	}
+}
+
+func (h *sidecarHost) close() {
+	h.stop.Do(func() {
+		close(h.closing)
+		if h.cmd == nil || h.cmd.Process == nil {
+			return
+		}
+		select {
+		case <-h.exited:
+			return
+		default:
+		}
+		_ = syscall.Kill(-h.cmd.Process.Pid, syscall.SIGTERM)
+		select {
+		case <-h.exited:
+		case <-time.After(3 * time.Second):
+			_ = syscall.Kill(-h.cmd.Process.Pid, syscall.SIGKILL)
+			<-h.exited
+		}
+	})
+}
+
+type requestInput struct {
+	Method      string `json:"method"`
+	Path        string `json:"path"`
+	Body        string `json:"body,omitempty"`
+	ContentType string `json:"contentType,omitempty"`
+}
+
+type requestOutput struct {
+	Status      int    `json:"status"`
+	Body        string `json:"body"`
+	ContentType string `json:"contentType"`
+}
+
+func hasParentSegment(path string) bool {
+	for _, segment := range strings.Split(path, "/") {
+		if segment == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func parseLocalPath(raw string, allowQuery bool) (*url.URL, error) {
+	if len(raw) == 0 || len(raw) > 2048 || !strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, "//") {
+		return nil, errors.New("path must be one bounded local absolute path")
+	}
+	parsed, err := url.ParseRequestURI(raw)
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.Fragment != "" || (!allowQuery && parsed.RawQuery != "") || hasParentSegment(parsed.Path) {
+		return nil, errors.New("path must be one bounded local absolute path")
+	}
+	return parsed, nil
+}
+
+func (h *sidecarHost) request(ctx context.Context, in requestInput) (requestOutput, error) {
+	user, ok := agentsdk.CallerFromContext(ctx).User()
+	if !ok {
+		return requestOutput{}, errors.New("authenticated user required")
+	}
+	switch in.Method {
+	case "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS":
+	default:
+		return requestOutput{}, errors.New("unsupported HTTP method")
+	}
+	if len(in.Body) > 1<<20 || len(in.ContentType) > 200 {
+		return requestOutput{}, errors.New("request body or content type exceeds the limit")
+	}
+	relative, err := parseLocalPath(in.Path, true)
+	if err != nil {
+		return requestOutput{}, errors.New("path must be local to the imported application")
+	}
+	allowed := false
+	for _, route := range h.config.ToolRoutes {
+		if route == in.Method+":"+relative.Path {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return requestOutput{}, errors.New("this endpoint is not approved for agent tool calls; use the application's own UI")
+	}
+	target := *h.target
+	target.Path = relative.Path
+	target.RawPath = relative.RawPath
+	target.RawQuery = relative.RawQuery
+	request, err := http.NewRequestWithContext(ctx, in.Method, target.String(), strings.NewReader(in.Body))
+	if err != nil {
+		return requestOutput{}, err
+	}
+	request.Header.Set("X-Airlock-User-ID", user.ID)
+	request.Header.Set("X-Airlock-Access", string(agentsdk.CallerFromContext(ctx).Access()))
+	if in.ContentType != "" {
+		request.Header.Set("Content-Type", in.ContentType)
+	}
+	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	response, err := client.Do(request)
+	if err != nil {
+		return requestOutput{}, errors.New("imported application request outcome is unconfirmed; inspect before retrying")
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
+	if err != nil || len(body) > 1<<20 {
+		return requestOutput{}, errors.New("imported application response failed or exceeded 1 MiB")
+	}
+	return requestOutput{Status: response.StatusCode, Body: string(body), ContentType: response.Header.Get("Content-Type")}, nil
+}
+
+func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--dockerfile" {
+		if err := scaffold.GenerateNotices("."); err != nil {
+			panic(err)
+		}
+		if err := scaffold.GenerateDockerfile(".", scaffold.ScaffoldData{AgentSDKVersion: "@AGENTSDK_VERSION@", AgentBaseImage: "ghcr.io/airlockrun/airlock-agent-base:v@AIRLOCK_VERSION@"}); err != nil {
+			panic(err)
+		}
+		return
+	}
+	app, host := newApplication()
+	defer host.close()
+	// A dead sidecar must not leave a green native wrapper running.
+	if os.Getenv("AIRLOCK_AGENT_MODE") != "manifest" {
+		go func() {
+			<-host.exited
+			select {
+			case <-host.closing:
+				return
+			default:
+			}
+			fmt.Fprintln(os.Stderr, "imported application exited; stopping native host")
+			os.Exit(1)
+		}()
+	}
+	app.Serve()
+}
