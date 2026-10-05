@@ -944,6 +944,9 @@ func validateManifestOutput(stdout []byte, overflow bool) error {
 }
 
 func manifestError(err error, stderr *boundedBuffer) error {
+	if stderr == nil {
+		return err
+	}
 	diagnostic := strings.TrimSpace(string(stderr.Bytes()))
 	if stderr.overflow {
 		diagnostic += "\n[stderr truncated]"

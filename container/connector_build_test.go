@@ -1,10 +1,18 @@
 package container
 
 import (
+	"errors"
 	"slices"
 	"strings"
 	"testing"
 )
+
+func TestManifestErrorWithoutDiagnosticBuffer(t *testing.T) {
+	want := errors.New("connector container failed before stderr capture")
+	if got := manifestError(want, nil); !errors.Is(got, want) {
+		t.Fatalf("manifestError(nil) = %v, want %v", got, want)
+	}
+}
 
 func TestConnectorCompilerStaysWithinSandboxProcessBudget(t *testing.T) {
 	for _, target := range []string{"", "linux-amd64", "linux-arm64"} {
