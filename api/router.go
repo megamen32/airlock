@@ -884,6 +884,7 @@ func NewRouter(cfg RouterConfig) *Router {
 		r.Post("/upgrade", ah.Upgrade)
 		r.Post("/print", ah.Print)
 		r.Get("/members", ah.ListMembers)
+		r.Post("/bridge-identities/resolve", ah.ResolveBridgeIdentities)
 		r.Post("/jobs", ah.EnqueueJob)
 		r.Get("/jobs", ah.ListJobs)
 		r.Get("/jobs/{jobID}", ah.GetJob)

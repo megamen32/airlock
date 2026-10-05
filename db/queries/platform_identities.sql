@@ -62,3 +62,32 @@ ORDER BY u.email, i.platform, i.created_at;
 -- Admin variant: delete any platform identity by id, without the
 -- caller's user_id constraint. Gated behind TenantIdentityManageAll.
 DELETE FROM platform_identities WHERE id = @id;
+
+-- name: ResolveAgentMemberPlatformIdentities :many
+-- Resolve only the explicitly supplied user principals. A missing per-user
+-- grant returns is_member=false and deliberately suppresses any identities,
+-- so an agent cannot use this query to probe arbitrary tenant users.
+WITH requested(user_id) AS (
+    SELECT unnest(@user_ids::uuid[])
+)
+SELECT requested.user_id::uuid AS user_id,
+       EXISTS (
+           SELECT 1
+           FROM agent_grants g
+           JOIN principals p ON p.id = g.grantee_id AND p.kind = 'user'
+           WHERE g.agent_id = @agent_id AND g.grantee_id = requested.user_id
+       ) AS is_member,
+       CASE WHEN EXISTS (
+           SELECT 1
+           FROM agent_grants g
+           JOIN principals p ON p.id = g.grantee_id AND p.kind = 'user'
+           WHERE g.agent_id = @agent_id AND g.grantee_id = requested.user_id
+       ) THEN COALESCE((
+           SELECT array_agg(i.platform_user_id ORDER BY i.platform_user_id)
+           FROM platform_identities i
+           WHERE i.user_id = requested.user_id AND i.platform = @platform
+       ), ARRAY[]::text[])
+       ELSE ARRAY[]::text[]
+       END AS platform_user_ids
+FROM requested
+ORDER BY requested.user_id;
