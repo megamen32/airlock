@@ -15,3 +15,5 @@
 
 # Caddy on-demand cert storage (bind-mounted into the dev container).
 /caddy-certs/
+# Cache created if a runtime command treats ${HOME} as a literal path.
+/${HOME}/
