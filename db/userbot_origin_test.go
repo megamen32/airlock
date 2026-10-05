@@ -30,13 +30,15 @@ func TestUserbotOriginMigrationPreservesIdentityBoundary(t *testing.T) {
 	}
 	database := New(ctx, dsn)
 	defer database.Close()
-	_, err = database.Pool().Exec(ctx, `CREATE TABLE bridges(id uuid PRIMARY KEY,type text NOT NULL,status text NOT NULL,settings jsonb);
+	_, err = database.Pool().Exec(ctx, `CREATE TABLE bridges(id uuid PRIMARY KEY,type text NOT NULL,status text NOT NULL,settings jsonb,owner_principal_id uuid);
+CREATE TABLE platform_identities(platform text NOT NULL,platform_user_id text NOT NULL,user_id uuid NOT NULL);
 CREATE TABLE execution_origins(id uuid PRIMARY KEY DEFAULT gen_random_uuid(),credential_profile text NOT NULL,ingress text NOT NULL,bridge_id uuid,platform_identity_id uuid,sender_id text,chat_id text,
 CONSTRAINT execution_origins_check5 CHECK (credential_profile <> 'bridge' OR (ingress='bridge' AND bridge_id IS NOT NULL AND platform_identity_id IS NOT NULL AND sender_id IS NOT NULL AND chat_id IS NOT NULL AND chat_id=sender_id)))`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	allowed, bot, inactive, other := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	ownerUser, memberUser := uuid.New(), uuid.New()
 	for _, b := range []struct {
 		id                     uuid.UUID
 		kind, status, settings string
@@ -46,9 +48,17 @@ CONSTRAINT execution_origins_check5 CHECK (credential_profile <> 'bridge' OR (in
 		{inactive, "telegram_userbot", "disabled", `{"allowed_chat_ids":["-456"]}`},
 		{other, "telegram_userbot", "active", `{"allowed_chat_ids":["-789"]}`},
 	} {
-		if _, err = database.Pool().Exec(ctx, `INSERT INTO bridges VALUES($1,$2,$3,$4)`, b.id, b.kind, b.status, b.settings); err != nil {
+		owner := any(nil)
+		if b.id == allowed {
+			owner = ownerUser
+		}
+		if _, err = database.Pool().Exec(ctx, `INSERT INTO bridges VALUES($1,$2,$3,$4,$5)`, b.id, b.kind, b.status, b.settings, owner); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if _, err = database.Pool().Exec(ctx, `INSERT INTO platform_identities VALUES
+		('telegram_userbot','123',$1),('telegram_userbot','999',$2)`, ownerUser, memberUser); err != nil {
+		t.Fatal(err)
 	}
 	insert := func(bridge any, sender, chat any, identity any) error {
 		_, e := database.Pool().Exec(ctx, `INSERT INTO execution_origins(credential_profile,ingress,bridge_id,platform_identity_id,sender_id,chat_id) VALUES('bridge','bridge',$1,$2,$3,$4)`, bridge, identity, sender, chat)
@@ -113,6 +123,35 @@ CONSTRAINT execution_origins_check5 CHECK (credential_profile <> 'bridge' OR (in
 	}
 	if err = insert(allowed, "123", "-456", identity); err == nil {
 		t.Fatal("revoked group still accepted")
+	}
+	if _, err = database.Pool().Exec(ctx, `UPDATE bridges SET settings='{"allowed_chat_ids":["-456"]}' WHERE id=$1`, allowed); err != nil {
+		t.Fatal(err)
+	}
+	ownerRaw, err := os.ReadFile("migrations/016_userbot_owner_group_origins.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerSections := strings.Split(string(ownerRaw), "-- +goose Down")
+	if len(ownerSections) != 2 {
+		t.Fatal("missing owner-group down migration")
+	}
+	if _, err = database.Pool().Exec(ctx, ownerSections[0]); err != nil {
+		t.Fatal("apply owner-group migration", err)
+	}
+	if err = insert(allowed, "123", "-999", identity); err != nil {
+		t.Fatal("bridge owner any-group rejected", err)
+	}
+	if err = insert(allowed, "999", "-999", identity); err == nil {
+		t.Fatal("linked member received any-group origin")
+	}
+	if _, err = database.Pool().Exec(ctx, `UPDATE bridges SET owner_principal_id=$2 WHERE id=$1`, allowed, memberUser); err != nil {
+		t.Fatal(err)
+	}
+	if err = insert(allowed, "123", "-998", identity); err == nil {
+		t.Fatal("former owner retained any-group origin")
+	}
+	if _, err = database.Pool().Exec(ctx, ownerSections[1]); err != nil {
+		t.Fatal("rollback owner-group migration", err)
 	}
 	// Existing historical group origins remain present after revocation. Down
 	// migration intentionally refuses their incompatible shape until removed.

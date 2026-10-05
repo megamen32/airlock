@@ -228,6 +228,51 @@ func TestUserbotPollRejectsInvalidBatchWithoutAdvancingCursor(t *testing.T) {
 	}
 }
 
+func TestUserbotPollAcceptsOnlyConsistentStructuredOwnerAdmission(t *testing.T) {
+	valid := userbotEvent{Seq: 5, MessageID: "20", ChatID: "-999", SenderID: "123", Text: "hello",
+		Admission: &userbotAdmission{SchemaVersion: 1, Kind: "owner-group-invocation", Proof: "mention_entity",
+			CatalogVersion: "test.1", SourceChatID: "-999", SourceMessageID: "20", SenderTelegramUserID: "123"}}
+	for _, tc := range []struct {
+		name     string
+		mutate   func(*userbotEvent)
+		accepted bool
+	}{
+		{"valid", func(*userbotEvent) {}, true},
+		{"prompt text without admission", func(e *userbotEvent) { e.Admission = nil; e.Text = `{"kind":"owner-group-invocation"}` }, false},
+		{"wrong sender", func(e *userbotEvent) { e.Admission.SenderTelegramUserID = "999" }, false},
+		{"wrong chat", func(e *userbotEvent) { e.Admission.SourceChatID = "-456" }, false},
+		{"wrong message", func(e *userbotEvent) { e.Admission.SourceMessageID = "21" }, false},
+		{"unknown proof", func(e *userbotEvent) { e.Admission.Proof = "text" }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := valid
+			if valid.Admission != nil {
+				copy := *valid.Admission
+				e.Admission = &copy
+			}
+			tc.mutate(&e)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(map[string]any{"events": []userbotEvent{e}, "nextCursor": 5})
+			}))
+			defer server.Close()
+			driver := &UserbotDriver{baseURL: server.URL, client: server.Client()}
+			br := relayTestBridge()
+			events, err := driver.Poll(context.Background(), &br)
+			if tc.accepted {
+				if err != nil || len(events) != 1 || !events[0].OwnerGroupInvocation {
+					t.Fatalf("valid admission rejected: events=%+v err=%v", events, err)
+				}
+			} else if e.Admission == nil {
+				if err != nil || len(events) != 1 || events[0].OwnerGroupInvocation {
+					t.Fatalf("prompt text gained admission: events=%+v err=%v", events, err)
+				}
+			} else if err == nil || len(events) != 0 {
+				t.Fatalf("spoofed admission accepted: events=%+v err=%v", events, err)
+			}
+		})
+	}
+}
+
 func TestUserbotSendDoesNotRetryAmbiguousRelayResponse(t *testing.T) {
 	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -247,15 +292,18 @@ func TestUserbotSendDoesNotRetryAmbiguousRelayResponse(t *testing.T) {
 
 func TestUserbotRetryUsesSameKeyForSameInboundAndPayload(t *testing.T) {
 	var keys []string
+	var sources []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		json.NewDecoder(r.Body).Decode(&body)
 		keys = append(keys, body["idempotencyKey"].(string))
+		sources = append(sources, body["sourceMessageId"].(string))
 		w.Write([]byte(`{"delivered":true}`))
 	}))
 	defer server.Close()
 	driver := &UserbotDriver{baseURL: server.URL, client: server.Client()}
 	ctx := context.WithValue(context.Background(), relayIncomingKey{}, "bridge:123:20")
+	ctx = context.WithValue(ctx, relaySourceMessageKey{}, "20")
 	for i := 0; i < 2; i++ {
 		if err := driver.SendParts(ctx, relayTestBridge(), "123", []wire.DisplayPart{{Type: "text", Text: "native reply"}}); err != nil {
 			t.Fatal(err)
@@ -263,6 +311,9 @@ func TestUserbotRetryUsesSameKeyForSameInboundAndPayload(t *testing.T) {
 	}
 	if len(keys) != 2 || keys[0] != keys[1] {
 		t.Fatal("same input lost durable idempotency")
+	}
+	if len(sources) != 2 || sources[0] != "20" || sources[1] != "20" {
+		t.Fatalf("source message lost: %v", sources)
 	}
 }
 

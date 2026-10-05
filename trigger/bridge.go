@@ -108,7 +108,10 @@ type BridgeEvent struct {
 	Callback          *BridgeCallback
 	ReferencedMessage *BridgeReferencedMessage // reply target / forward source (driver-populated)
 	ManagedBot        *ManagedBotEvent         // Telegram managed_bot_created service message (manager bridges only)
-	RawPayload        []byte
+	// Set only by the authenticated userbot driver after validating the relay's
+	// structured transport admission. Prompt text cannot set this bit.
+	OwnerGroupInvocation bool
+	RawPayload           []byte
 }
 
 // ManagedBotEvent carries a Telegram `managed_bot_created` service message —
@@ -617,6 +620,7 @@ func (m *BridgeManager) HandleEvent(ctx context.Context, event BridgeEvent) erro
 		var relay userbotEvent
 		if json.Unmarshal(event.RawPayload, &relay) == nil && relay.Seq > 0 && relay.MessageID != "" {
 			ctx = context.WithValue(ctx, relayIncomingKey{}, event.BridgeID.String()+":"+relay.ChatID+":"+relay.MessageID)
+			ctx = context.WithValue(ctx, relaySourceMessageKey{}, relay.MessageID)
 		}
 	}
 	q := dbq.New(m.db.Pool())
@@ -689,7 +693,13 @@ func (m *BridgeManager) HandleEvent(ctx context.Context, event BridgeEvent) erro
 	// Resolve user_id from platform identity. Lookup failure means the
 	// sender hasn't run /auth — bridge chat requires a linked identity, so
 	// we silently drop. (/auth itself ran above, before this gate.)
-	claims, idErr := auth.AdmitBridge(ctx, q, event.BridgeID, event.SenderID, event.ExternalID)
+	var claims *auth.Claims
+	var idErr error
+	if br.Type == "telegram_userbot" && event.OwnerGroupInvocation {
+		claims, idErr = auth.AdmitUserbotOwnerGroup(ctx, q, event.BridgeID, event.SenderID, event.ExternalID)
+	} else {
+		claims, idErr = auth.AdmitBridge(ctx, q, event.BridgeID, event.SenderID, event.ExternalID)
+	}
 	if idErr != nil {
 		if isStartCommand(event.Text) {
 			return m.handleAuthCommand(ctx, br, driver, event)

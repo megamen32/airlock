@@ -90,7 +90,13 @@ func (c *Claims) Identity() *Identity {
 // Resolve refreshes account and session state without trusting a caller's role.
 func (i *Identity) Resolve(ctx context.Context, q *dbq.Queries) (*Claims, error) {
 	if i != nil && i.bridge != nil {
-		live, err := AdmitBridge(ctx, q, i.bridge.bridgeID, i.bridge.senderID, i.bridge.chatID)
+		var live *Claims
+		var err error
+		if i.bridge.ownerGroup {
+			live, err = AdmitUserbotOwnerGroup(ctx, q, i.bridge.bridgeID, i.bridge.senderID, i.bridge.chatID)
+		} else {
+			live, err = AdmitBridge(ctx, q, i.bridge.bridgeID, i.bridge.senderID, i.bridge.chatID)
+		}
 		if err != nil || live.Subject != i.claims.Subject || live.AuthEpoch != i.claims.AuthEpoch || *live.identity.bridge != *i.bridge {
 			return nil, apperr.ErrUnauthorized
 		}

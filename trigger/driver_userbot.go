@@ -79,15 +79,45 @@ type userbotFile struct {
 	FileRef     string `json:"fileRef"`
 }
 type userbotEvent struct {
-	Seq         int64         `json:"seq"`
-	MessageID   string        `json:"messageId"`
-	ChatID      string        `json:"chatId"`
-	SenderID    string        `json:"senderId"`
-	SenderName  string        `json:"senderName"`
-	Text        string        `json:"text"`
-	Direct      bool          `json:"isDirectMessage"`
-	ShouldReply *bool         `json:"shouldReply,omitempty"`
-	Files       []userbotFile `json:"files"`
+	Seq         int64             `json:"seq"`
+	MessageID   string            `json:"messageId"`
+	ChatID      string            `json:"chatId"`
+	SenderID    string            `json:"senderId"`
+	SenderName  string            `json:"senderName"`
+	Text        string            `json:"text"`
+	Direct      bool              `json:"isDirectMessage"`
+	ShouldReply *bool             `json:"shouldReply,omitempty"`
+	Admission   *userbotAdmission `json:"admission,omitempty"`
+	Files       []userbotFile     `json:"files"`
+}
+
+type userbotAdmission struct {
+	SchemaVersion        int    `json:"schemaVersion"`
+	Kind                 string `json:"kind"`
+	Proof                string `json:"proof"`
+	CatalogVersion       string `json:"catalogVersion"`
+	SourceChatID         string `json:"sourceChatId"`
+	SourceMessageID      string `json:"sourceMessageId"`
+	SenderTelegramUserID string `json:"senderTelegramUserId"`
+}
+
+func ownerGroupAdmission(ev userbotEvent) (bool, error) {
+	if ev.Admission == nil {
+		return false, nil
+	}
+	a := ev.Admission
+	chatNumber, chatErr := strconv.ParseInt(ev.ChatID, 10, 64)
+	messageNumber, messageErr := strconv.ParseInt(ev.MessageID, 10, 64)
+	senderNumber, senderErr := strconv.ParseInt(ev.SenderID, 10, 64)
+	if a.SchemaVersion != 1 || a.Kind != "owner-group-invocation" ||
+		(a.Proof != "mention_entity" && a.Proof != "reply_to_account") ||
+		a.CatalogVersion == "" || len(a.CatalogVersion) > 64 ||
+		a.SourceChatID != ev.ChatID || a.SourceMessageID != ev.MessageID ||
+		a.SenderTelegramUserID != ev.SenderID || ev.Direct ||
+		chatErr != nil || chatNumber >= 0 || messageErr != nil || messageNumber <= 0 || senderErr != nil || senderNumber <= 0 {
+		return false, fmt.Errorf("invalid owner group admission")
+	}
+	return true, nil
 }
 
 func (d *UserbotDriver) Poll(ctx context.Context, br *dbq.Bridge) ([]BridgeEvent, error) {
@@ -111,7 +141,11 @@ func (d *UserbotDriver) Poll(ctx context.Context, br *dbq.Bridge) ([]BridgeEvent
 			return nil, fmt.Errorf("invalid authenticated relay event")
 		}
 		last = ev.Seq
-		e := BridgeEvent{BridgeID: uuid.UUID(br.ID.Bytes), ExternalID: ev.ChatID, SenderID: ev.SenderID, SenderName: ev.SenderName, Text: ev.Text}
+		ownerGroup, err := ownerGroupAdmission(ev)
+		if err != nil {
+			return nil, err
+		}
+		e := BridgeEvent{BridgeID: uuid.UUID(br.ID.Bytes), ExternalID: ev.ChatID, SenderID: ev.SenderID, SenderName: ev.SenderName, Text: ev.Text, OwnerGroupInvocation: ownerGroup}
 		for _, f := range ev.Files {
 			if f.FileRef != "" {
 				if len(f.FileRef) != 64 {
@@ -164,6 +198,7 @@ func (d *UserbotDriver) Poll(ctx context.Context, br *dbq.Bridge) ([]BridgeEvent
 }
 
 type relayIncomingKey struct{}
+type relaySourceMessageKey struct{}
 
 func relayDeliveryKey(ctx context.Context, scope, body string) string {
 	incoming, _ := ctx.Value(relayIncomingKey{}).(string)
@@ -173,8 +208,12 @@ func relayDeliveryKey(ctx context.Context, scope, body string) string {
 	sum := sha256.Sum256([]byte(incoming + "\n" + scope))
 	return hex.EncodeToString(sum[:])
 }
+func relaySourceMessage(ctx context.Context) string {
+	value, _ := ctx.Value(relaySourceMessageKey{}).(string)
+	return value
+}
 func (d *UserbotDriver) sendText(ctx context.Context, br dbq.Bridge, chat, text, key string) error {
-	return d.request(ctx, br, "POST", "/send", map[string]string{"chatId": chat, "text": text, "idempotencyKey": key}, nil)
+	return d.request(ctx, br, "POST", "/send", map[string]string{"chatId": chat, "text": text, "idempotencyKey": key, "sourceMessageId": relaySourceMessage(ctx)}, nil)
 }
 func (d *UserbotDriver) SendStream(ctx context.Context, br dbq.Bridge, chat string, echo bool, events <-chan ResponseEvent) (string, error) {
 	var text strings.Builder
@@ -264,7 +303,7 @@ func (d *UserbotDriver) SendParts(ctx context.Context, br dbq.Bridge, chat strin
 				}
 				p.Data = data
 			}
-			if err := d.request(ctx, br, "POST", "/file", map[string]any{"chatId": chat, "idempotencyKey": key, "filename": p.Filename, "dataBase64": p.Data, "caption": p.Text}, nil); err != nil {
+			if err := d.request(ctx, br, "POST", "/file", map[string]any{"chatId": chat, "idempotencyKey": key, "filename": p.Filename, "dataBase64": p.Data, "caption": p.Text, "sourceMessageId": relaySourceMessage(ctx)}, nil); err != nil {
 				return err
 			}
 		}

@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 
 	"github.com/airlockrun/airlock/apperr"
@@ -37,6 +38,7 @@ type bridgeCredential struct {
 	identityID uuid.UUID
 	agentID    pgtype.UUID
 	system     bool
+	ownerGroup bool
 }
 
 type admittedBridgeContextKey struct{}
@@ -64,6 +66,17 @@ func AdmitBridgeConversation(ctx context.Context, q *dbq.Queries, bridgeID uuid.
 // Telegram poller. A transport supplies platform coordinates, never an Airlock
 // user UUID or role. Linked identity and account state are resolved live.
 func AdmitBridge(ctx context.Context, q *dbq.Queries, bridgeID uuid.UUID, senderID, chatID string) (*Claims, error) {
+	return admitBridge(ctx, q, bridgeID, senderID, chatID, false)
+}
+
+// AdmitUserbotOwnerGroup admits only a transport-verified explicit owner
+// invocation. It never widens the configured group allowlist for members: the
+// linked sender must also be the bridge's current owner principal.
+func AdmitUserbotOwnerGroup(ctx context.Context, q *dbq.Queries, bridgeID uuid.UUID, senderID, chatID string) (*Claims, error) {
+	return admitBridge(ctx, q, bridgeID, senderID, chatID, true)
+}
+
+func admitBridge(ctx context.Context, q *dbq.Queries, bridgeID uuid.UUID, senderID, chatID string, ownerGroup bool) (*Claims, error) {
 	if q == nil {
 		panic("auth: bridge admission queries are required")
 	}
@@ -74,13 +87,20 @@ func AdmitBridge(ctx context.Context, q *dbq.Queries, bridgeID uuid.UUID, sender
 	if err != nil || bridge.Status != "active" || (bridge.Type != "telegram" && bridge.Type != "telegram_userbot") {
 		return nil, apperr.ErrUnauthorized
 	}
-	if chatID != senderID {
-		if bridge.Type != "telegram_userbot" || !allowedUserbotGroup(bridge.Settings, chatID) {
-			return nil, apperr.ErrUnauthorized
-		}
+	if chatID != senderID && bridge.Type != "telegram_userbot" {
+		return nil, apperr.ErrUnauthorized
 	}
 	linked, err := q.GetPlatformIdentity(ctx, dbq.GetPlatformIdentityParams{Platform: bridge.Type, PlatformUserID: senderID})
 	if err != nil || !linked.UserID.Valid || uuid.UUID(linked.UserID.Bytes) == uuid.Nil {
+		return nil, apperr.ErrUnauthorized
+	}
+	if ownerGroup {
+		chatNumber, parseErr := strconv.ParseInt(chatID, 10, 64)
+		if bridge.Type != "telegram_userbot" || parseErr != nil || chatNumber >= 0 ||
+			!bridge.OwnerPrincipalID.Valid || bridge.OwnerPrincipalID != linked.UserID {
+			return nil, apperr.ErrUnauthorized
+		}
+	} else if chatID != senderID && !allowedUserbotGroup(bridge.Settings, chatID) {
 		return nil, apperr.ErrUnauthorized
 	}
 	user, err := q.GetUserByID(ctx, linked.UserID)
@@ -95,6 +115,6 @@ func AdmitBridge(ctx context.Context, q *dbq.Queries, bridgeID uuid.UUID, sender
 	if err := RequireSecuredAccount(claims); err != nil {
 		return nil, err
 	}
-	claims.identity = &Identity{claims: *claims, bridge: &bridgeCredential{bridgeID: bridgeID, senderID: senderID, chatID: chatID, identityID: uuid.UUID(linked.ID.Bytes), agentID: bridge.AgentID, system: bridge.IsSystem}}
+	claims.identity = &Identity{claims: *claims, bridge: &bridgeCredential{bridgeID: bridgeID, senderID: senderID, chatID: chatID, identityID: uuid.UUID(linked.ID.Bytes), agentID: bridge.AgentID, system: bridge.IsSystem, ownerGroup: ownerGroup}}
 	return claims, nil
 }

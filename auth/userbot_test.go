@@ -37,6 +37,7 @@ func (d *userbotDB) QueryRow(ctx context.Context, sql string, args ...any) pgx.R
 		case strings.Contains(sql, "name: GetBridgeByID"):
 			*out[0].(*pgtype.UUID) = d.bridge.ID
 			*out[1].(*pgtype.UUID) = d.bridge.AgentID
+			*out[2].(*pgtype.UUID) = d.bridge.OwnerPrincipalID
 			*out[3].(*string) = d.bridge.Type
 			*out[6].(*string) = d.bridge.Status
 			*out[7].(*bool) = d.bridge.IsSystem
@@ -64,8 +65,35 @@ func (d *userbotDB) QueryRow(ctx context.Context, sql string, args ...any) pgx.R
 func userbotAuthFixture() (*userbotDB, *dbq.Queries) {
 	id := func() pgtype.UUID { return pgtype.UUID{Bytes: uuid.New(), Valid: true} }
 	userID := id()
-	d := &userbotDB{bridge: dbq.Bridge{ID: id(), AgentID: id(), Type: "telegram_userbot", Status: "active", Settings: []byte(`{"allowed_chat_ids":["-456"]}`)}, linked: dbq.PlatformIdentity{ID: id(), UserID: userID}, user: dbq.User{ID: userID, TenantRole: "user", AuthEpoch: 1}}
+	d := &userbotDB{bridge: dbq.Bridge{ID: id(), AgentID: id(), OwnerPrincipalID: userID, Type: "telegram_userbot", Status: "active", Settings: []byte(`{"allowed_chat_ids":["-456"]}`)}, linked: dbq.PlatformIdentity{ID: id(), UserID: userID}, user: dbq.User{ID: userID, TenantRole: "user", AuthEpoch: 1}}
 	return d, dbq.New(d)
+}
+
+func TestUserbotOwnerGroupAdmissionDoesNotWidenMemberAllowlist(t *testing.T) {
+	d, q := userbotAuthFixture()
+	bridgeID := uuid.UUID(d.bridge.ID.Bytes)
+	if _, err := AdmitBridge(context.Background(), q, bridgeID, "123", "-999"); err == nil {
+		t.Fatal("ordinary admission bypassed static groups")
+	}
+	claims, err := AdmitUserbotOwnerGroup(context.Background(), q, bridgeID, "123", "-999")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = claims.identity.Resolve(context.Background(), q); err != nil {
+		t.Fatal("owner invocation did not survive live revalidation", err)
+	}
+	d.bridge.OwnerPrincipalID.Bytes = uuid.New()
+	if _, err = AdmitUserbotOwnerGroup(context.Background(), q, bridgeID, "123", "-999"); err == nil {
+		t.Fatal("linked non-owner received any-group authority")
+	}
+	if _, err = claims.identity.Resolve(context.Background(), q); err == nil {
+		t.Fatal("revoked owner retained any-group authority")
+	}
+	d, q = userbotAuthFixture()
+	d.bridge.Type = "telegram"
+	if _, err = AdmitUserbotOwnerGroup(context.Background(), q, uuid.UUID(d.bridge.ID.Bytes), "123", "-999"); err == nil {
+		t.Fatal("Bot API bridge received userbot owner-group authority")
+	}
 }
 func TestUserbotAdmissionUsesPlatformIdentityAndExplicitGroups(t *testing.T) {
 	d, q := userbotAuthFixture()
